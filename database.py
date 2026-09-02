@@ -1,9 +1,31 @@
-import os
+"""
+Persistence layer: SQLAlchemy models + the atomic business operations that must never
+be duplicated across the code base (link burning, credit deduction, order fulfilment).
+
+Concurrency model
+-----------------
+* Single-use links are burned with a conditional UPDATE (`WHERE status='available'`)
+  and a rowcount check, so two concurrent claims can never receive the same link -
+  on SQLite (WAL + busy_timeout) and on Postgres alike.
+* Credits are deducted with `UPDATE ... WHERE credits_balance >= :n`, never with a
+  read-modify-write in Python.
+* Every multi-step operation runs inside one transaction and is rolled back as a whole.
+"""
 import re
+import secrets
+import string
 import datetime
+import logging
+import threading
 from typing import Optional, List, Dict, Any, Tuple
+
 from sqlalchemy import (
     create_engine,
+    event,
+    inspect,
+    text,
+    update,
+    func,
     Column,
     Integer,
     String,
@@ -12,28 +34,60 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Text,
-    desc
+    Index,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, scoped_session
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "vending_bot.db")
-DATABASE_URL = f"sqlite:///{DB_PATH}"
+from config import Config
 
-engine = create_engine(
-    DATABASE_URL, 
-    connect_args={"check_same_thread": False},
-    echo=False
-)
+logger = logging.getLogger(__name__)
 
-# Enable WAL mode for high concurrency in SQLite
-with engine.connect() as connection:
-    connection.exec_driver_sql("PRAGMA journal_mode=WAL;")
-    connection.exec_driver_sql("PRAGMA synchronous=NORMAL;")
+# =====================================================================
+# Engine & session factory
+# =====================================================================
 
-SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
+DATABASE_URL = Config.DATABASE_URL
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
+
+_engine_kwargs: Dict[str, Any] = {"echo": False, "pool_pre_ping": True}
+if IS_SQLITE:
+    _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+else:
+    _engine_kwargs.update({"pool_size": 10, "max_overflow": 20})
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
+
+if IS_SQLITE:
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):
+        """Applied to every pooled connection: WAL for concurrency, busy_timeout so
+        writers wait instead of failing with 'database is locked'."""
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        cur.execute("PRAGMA busy_timeout=5000;")
+        cur.execute("PRAGMA foreign_keys=ON;")
+        cur.close()
+
+# Session-per-call (NOT scoped_session): every get_db() returns an independent Session.
+# This is essential - helper functions that create their own session (db=None) close it in
+# `finally`; with a thread-shared scoped session that close would detach objects still in use
+# by the calling request. Concurrency is handled per request, with _CLAIM_LOCK guarding writes.
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
+# SQLite serialises writers anyway; this lock keeps the claim critical section short
+# and avoids busy-timeout churn under bursts. It is a no-op safety net on Postgres.
+_CLAIM_LOCK = threading.RLock()
+
+
+def utcnow() -> datetime.datetime:
+    return datetime.datetime.utcnow()
+
+
+# =====================================================================
+# Models
+# =====================================================================
 
 class Product(Base):
     __tablename__ = "products"
@@ -43,28 +97,26 @@ class Product(Base):
     slug = Column(String(100), unique=True, nullable=False)
     category = Column(String(50), default="AI Tools")
     description = Column(Text, default="")
-    base_price = Column(Float, nullable=False, default=0.0) # Admin cost
-    margin_percent = Column(Float, nullable=False, default=30.0) # Margin %
-    credit_cost = Column(Integer, nullable=False, default=1) # Credits for reseller
+    base_price = Column(Float, nullable=False, default=0.0)        # Admin cost
+    margin_percent = Column(Float, nullable=False, default=30.0)   # Live margin %
+    credit_cost = Column(Integer, nullable=False, default=1)       # Credits per link for resellers
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
     links = relationship("InviteLink", back_populates="product", cascade="all, delete-orphan")
 
     def get_customer_price(self) -> float:
-        """Dynamically computes customer selling price: base_price + (base_price * margin% / 100)"""
-        margin_amount = self.base_price * (self.margin_percent / 100.0)
-        return round(self.base_price + margin_amount, 2)
+        """Customer price = base + base * margin% / 100 (computed live, never stored)."""
+        return round(self.base_price + self.base_price * (self.margin_percent / 100.0), 2)
 
     def get_available_stock_count(self, session) -> int:
-        return session.query(InviteLink).filter(
+        return session.query(func.count(InviteLink.id)).filter(
             InviteLink.product_id == self.id,
-            InviteLink.status == "available"
-        ).count()
+            InviteLink.status == "available",
+        ).scalar() or 0
 
     def to_dict(self, session=None) -> Dict[str, Any]:
         stock = self.get_available_stock_count(session) if session else 0
-        customer_price = self.get_customer_price()
         return {
             "id": self.id,
             "name": self.name,
@@ -73,33 +125,33 @@ class Product(Base):
             "description": self.description,
             "base_price": self.base_price,
             "margin_percent": self.margin_percent,
-            "customer_price": customer_price,
+            "customer_price": self.get_customer_price(),
             "credit_cost": self.credit_cost,
             "is_active": self.is_active,
             "stock_count": stock,
             "in_stock": stock > 0,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
 class InviteLink(Base):
     """
-    Single-Use Link / Key Inventory table.
-    Crucial Rule: A link can only be in 'available' or 'claimed' status.
-    Once claimed, it is permanently locked and NEVER delivered to anyone else.
+    Single-use link / key inventory. Status is only ever 'available' -> 'claimed';
+    a claimed row is immutable and never handed out again.
     """
     __tablename__ = "invite_links"
+    __table_args__ = (Index("ix_invite_links_product_status", "product_id", "status"),)
 
     id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
     link_or_key = Column(Text, nullable=False)
-    status = Column(String(20), default="available", index=True) # "available" or "claimed"
-    claimed_by_type = Column(String(20), nullable=True) # "customer", "reseller", "admin"
-    claimed_by_id = Column(String(100), nullable=True) # phone number or customer id
+    status = Column(String(20), default="available", index=True)
+    claimed_by_type = Column(String(20), nullable=True)   # "customer" | "reseller" | "admin"
+    claimed_by_id = Column(String(100), nullable=True)    # phone / client id
     claimed_at = Column(DateTime, nullable=True)
-    order_id = Column(String(50), nullable=True)
+    order_id = Column(String(50), nullable=True, index=True)
     notes = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
     product = relationship("Product", back_populates="links")
 
@@ -114,7 +166,7 @@ class InviteLink(Base):
             "claimed_by_id": self.claimed_by_id,
             "claimed_at": self.claimed_at.isoformat() if self.claimed_at else None,
             "order_id": self.order_id,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
@@ -124,27 +176,40 @@ class Reseller(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
     phone = Column(String(30), unique=True, index=True, nullable=False)
-    secret_code = Column(String(10), nullable=False) # 4-digit passcode
+    secret_code = Column(String(10), nullable=False)   # 4-digit passcode
     credits_balance = Column(Integer, default=0, nullable=False)
     is_active = Column(Boolean, default=True)
     notes = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    # Brute-force protection
+    failed_attempts = Column(Integer, default=0, nullable=False)
+    locked_until = Column(DateTime, nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     transactions = relationship("CreditTransaction", back_populates="reseller", cascade="all, delete-orphan")
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def is_locked(self) -> bool:
+        return bool(self.locked_until and self.locked_until > utcnow())
+
+    def to_dict(self, include_secret: bool = True) -> Dict[str, Any]:
+        data = {
             "id": self.id,
             "name": self.name,
             "phone": self.phone,
-            "secret_code": self.secret_code,
             "credits_balance": self.credits_balance,
             "is_active": self.is_active,
+            "is_locked": self.is_locked(),
+            "failed_attempts": self.failed_attempts or 0,
+            "locked_until": self.locked_until.isoformat() if self.locked_until else None,
+            "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
             "notes": self.notes,
             "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+        if include_secret:
+            data["secret_code"] = self.secret_code
+        return data
 
 
 class CreditTransaction(Base):
@@ -152,13 +217,13 @@ class CreditTransaction(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     reseller_id = Column(Integer, ForeignKey("resellers.id"), nullable=False, index=True)
-    amount = Column(Integer, nullable=False) # +credits or -credits
+    amount = Column(Integer, nullable=False)          # +credits / -credits
     balance_after = Column(Integer, nullable=False)
-    reason = Column(String(50), nullable=False) # "claim_link", "admin_topup", "admin_deduct", "purchase"
+    reason = Column(String(50), nullable=False)       # claim_link | admin_topup | admin_deduct | purchase
     product_id = Column(Integer, nullable=True)
     link_id = Column(Integer, nullable=True)
     reference_note = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
     reseller = relationship("Reseller", back_populates="transactions")
 
@@ -174,32 +239,38 @@ class CreditTransaction(Base):
             "product_id": self.product_id,
             "link_id": self.link_id,
             "reference_note": self.reference_note,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
 class CustomerOrder(Base):
     __tablename__ = "customer_orders"
 
-    id = Column(String(50), primary_key=True, index=True) # e.g. ORD-7821
+    id = Column(String(50), primary_key=True, index=True)      # ORD-XXXXXX
+    session_id = Column(String(100), nullable=True, index=True)  # chat session that created it
+    platform = Column(String(20), default="web")
     customer_name = Column(String(100), default="Customer")
-    customer_phone = Column(String(30), nullable=True)
+    customer_phone = Column(String(30), nullable=True, index=True)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
     quantity = Column(Integer, default=1)
     unit_price = Column(Float, nullable=False)
     total_amount = Column(Float, nullable=False)
     payment_method = Column(String(30), default="UPI_QR")
-    payment_ref = Column(String(100), nullable=True) # UTR / Transaction reference
-    status = Column(String(30), default="pending_payment") # "pending_payment", "paid", "delivered", "cancelled"
+    payment_ref = Column(String(100), nullable=True, index=True)   # UTR / txn reference
+    status = Column(String(30), default="pending_payment", index=True)  # pending_payment | delivered | cancelled | fulfillment_pending
     delivered_link_id = Column(Integer, nullable=True)
     delivered_link_content = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    paid_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utcnow, index=True)
 
     product = relationship("Product")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
+            "session_id": self.session_id,
+            "platform": self.platform,
             "customer_name": self.customer_name,
             "customer_phone": self.customer_phone,
             "product_id": self.product_id,
@@ -212,7 +283,9 @@ class CustomerOrder(Base):
             "status": self.status,
             "delivered_link_id": self.delivered_link_id,
             "delivered_link_content": self.delivered_link_content,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "paid_at": self.paid_at.isoformat() if self.paid_at else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
@@ -221,18 +294,25 @@ class SystemSettings(Base):
 
     id = Column(Integer, primary_key=True, default=1)
     business_name = Column(String(150), default="AI Digital Vending Hub")
-    admin_upi_id = Column(String(100), default="resellerpay@upi")
-    admin_upi_name = Column(String(100), default="Digital Vending Admin")
+    admin_upi_id = Column(String(100), default=Config.ADMIN_UPI_ID)
+    admin_upi_name = Column(String(100), default=Config.ADMIN_UPI_NAME)
     qr_code_image_url = Column(Text, nullable=True)
-    reseller_credit_rate_inr = Column(Float, default=150.0) # Rs per credit
+    reseller_credit_rate_inr = Column(Float, default=Config.RESELLER_CREDIT_RATE_INR)
     reseller_terms = Column(Text, default="Minimum credit pack: 10 Credits (Rs 1,500). 1 Credit = 1 Single-Use Invite Link.")
-    evolution_api_url = Column(String(200), default="http://localhost:8080")
-    evolution_api_key = Column(String(200), default="B6D711FCDE4D4FD5936544120E713976")
-    evolution_instance_name = Column(String(100), default="VendingBot")
+    evolution_api_url = Column(String(200), default=Config.EVOLUTION_API_URL)
+    evolution_api_key = Column(String(200), default=Config.EVOLUTION_API_KEY)
+    evolution_instance_name = Column(String(100), default=Config.EVOLUTION_INSTANCE_NAME)
     openai_api_key = Column(String(200), nullable=True)
-    openai_model_name = Column(String(50), default="gpt-4o-mini")
+    openai_model_name = Column(String(50), default=Config.OPENAI_MODEL_NAME)
+
+    @staticmethod
+    def _mask(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        return "••••" + value[-4:] if len(value) > 4 else "••••"
 
     def to_dict(self) -> Dict[str, Any]:
+        """Secrets are never returned in clear text - only a masked tail."""
         return {
             "id": self.id,
             "business_name": self.business_name,
@@ -242,10 +322,11 @@ class SystemSettings(Base):
             "reseller_credit_rate_inr": self.reseller_credit_rate_inr,
             "reseller_terms": self.reseller_terms,
             "evolution_api_url": self.evolution_api_url,
-            "evolution_api_key": self.evolution_api_key,
+            "evolution_api_key": self._mask(self.evolution_api_key),
             "evolution_instance_name": self.evolution_instance_name,
             "openai_model_name": self.openai_model_name,
-            "has_openai_key": bool(self.openai_api_key or os.getenv("OPENAI_API_KEY"))
+            "openai_api_key": self._mask(self.openai_api_key),
+            "has_openai_key": bool(self.openai_api_key or Config.OPENAI_API_KEY),
         }
 
 
@@ -253,22 +334,39 @@ class ChatSessionRecord(Base):
     __tablename__ = "chat_sessions"
 
     id = Column(String(100), primary_key=True)
-    user_type = Column(String(30), default="customer") # "customer" or "reseller"
+    owner_id = Column(String(100), nullable=True, index=True)   # browser client id / WhatsApp phone
+    platform = Column(String(20), default="web")                # web | whatsapp
+    user_type = Column(String(30), default="customer")          # customer | reseller
     title = Column(String(200), default="New Conversation")
+    customer_name = Column(String(100), nullable=True)
+    customer_phone = Column(String(30), nullable=True)
+    # Reseller "login" state for this conversation
+    reseller_id = Column(Integer, nullable=True)
     reseller_phone = Column(String(30), nullable=True)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    reseller_verified_at = Column(DateTime, nullable=True)
+    # Most recent order created from this conversation
+    last_order_id = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, index=True)
 
-    messages = relationship("ChatMessageRecord", back_populates="session", cascade="all, delete-orphan", order_by="ChatMessageRecord.id")
+    messages = relationship(
+        "ChatMessageRecord", back_populates="session",
+        cascade="all, delete-orphan", order_by="ChatMessageRecord.id",
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
+            "owner_id": self.owner_id,
+            "platform": self.platform,
             "user_type": self.user_type,
             "title": self.title,
+            "customer_phone": self.customer_phone,
             "reseller_phone": self.reseller_phone,
+            "reseller_verified": bool(self.reseller_id),
+            "last_order_id": self.last_order_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 
@@ -277,10 +375,10 @@ class ChatMessageRecord(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String(100), ForeignKey("chat_sessions.id"), nullable=False, index=True)
-    role = Column(String(20), nullable=False) # "user", "assistant", "system"
+    role = Column(String(20), nullable=False)   # user | assistant | system
     content = Column(Text, nullable=False)
-    metadata_json = Column(Text, nullable=True) # JSON for claimed link, payment card, todos, etc.
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    metadata_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
 
     session = relationship("ChatSessionRecord", back_populates="messages")
 
@@ -291,44 +389,45 @@ class ChatMessageRecord(Base):
             "role": self.role,
             "content": self.content,
             "metadata": self.metadata_json,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
 # =====================================================================
-# Database Utility & Atomic Business Logic Functions
+# Helpers
 # =====================================================================
 
-def normalize_phone(phone: str) -> str:
-    """Strip spaces, dashes, parentheses and normalize phone numbers."""
+def normalize_phone(phone: Optional[str]) -> str:
+    """Strip formatting and reduce Indian numbers to their 10-digit form."""
     if not phone:
         return ""
     clean = re.sub(r"[^\d+]", "", str(phone).strip())
-    # Standardize 10 digit Indian numbers
-    if len(clean) == 10 and not clean.startswith("+"):
-        return clean
     if clean.startswith("+91") and len(clean) == 13:
         return clean[3:]
     if clean.startswith("91") and len(clean) == 12:
         return clean[2:]
+    if clean.startswith("0") and len(clean) == 11:
+        return clean[1:]
     return clean
 
 
+def is_valid_secret_code(code: str) -> bool:
+    return bool(re.fullmatch(r"\d{4}", str(code or "").strip()))
+
+
+def is_plausible_payment_ref(ref: str) -> bool:
+    """UPI UTRs are 12 digits; bank references vary. Accept 6-40 alphanumerics."""
+    return bool(re.fullmatch(r"[A-Za-z0-9\-]{6,40}", str(ref or "").strip()))
+
+
 def get_db():
-    """Provides a thread-safe database session."""
-    db = SessionLocal()
-    try:
-        return db
-    finally:
-        pass
+    """Thread-local SQLAlchemy session. Caller must `close()`."""
+    return SessionLocal()
 
 
 def get_settings(db=None) -> SystemSettings:
-    """Fetch singleton system settings or create default."""
-    close_when_done = False
-    if db is None:
-        db = get_db()
-        close_when_done = True
+    close_when_done = db is None
+    db = db or get_db()
     try:
         settings = db.query(SystemSettings).filter(SystemSettings.id == 1).first()
         if not settings:
@@ -342,289 +441,484 @@ def get_settings(db=None) -> SystemSettings:
             db.close()
 
 
+def find_product(db, name_or_slug_or_id: Any, active_only: bool = True) -> Optional[Product]:
+    """Resolve a product by id, exact slug, or fuzzy name/slug match (best match first)."""
+    if name_or_slug_or_id is None:
+        return None
+    q = db.query(Product)
+    if active_only:
+        q = q.filter(Product.is_active == True)  # noqa: E712
+
+    raw = str(name_or_slug_or_id).strip()
+    if raw.isdigit():
+        return q.filter(Product.id == int(raw)).first()
+
+    exact = q.filter(func.lower(Product.slug) == raw.lower()).first()
+    if exact:
+        return exact
+
+    like = f"%{raw}%"
+    candidates = q.filter((Product.slug.ilike(like)) | (Product.name.ilike(like))).all()
+    if candidates:
+        # Prefer the shortest name: "Claude Pro" beats "Claude Pro Team Bundle" for "claude".
+        return sorted(candidates, key=lambda p: len(p.name))[0]
+
+    # Free-text fallback ("claude ki link do"): score products by how many of their
+    # *distinctive* name/slug tokens appear in the text. Generic words such as
+    # "link", "invite" or "pro" are ignored so they can't pull in the wrong product.
+    text_tokens = set(re.findall(r"[a-z0-9]+", raw.lower()))
+    best, best_score = None, 0
+    for p in q.all():
+        tokens = set(re.findall(r"[a-z0-9]+", f"{p.name} {p.slug}".lower()))
+        distinctive = {t for t in tokens if len(t) >= 4 and t not in _GENERIC_PRODUCT_WORDS}
+        score = len(distinctive & text_tokens)
+        if score > best_score or (score == best_score and score and len(p.name) < len(best.name)):
+            best, best_score = p, score
+    return best if best_score > 0 else None
+
+
+_GENERIC_PRODUCT_WORDS = {
+    "link", "links", "invite", "invitation", "private", "organization", "organisation", "account",
+    "year", "month", "lifetime", "seat", "workspace", "device", "devices", "enterprise", "edu",
+    "premium", "plus", "advanced", "with", "from", "digital", "product", "subscription", "access",
+    "family", "team", "plan", "pack", "license", "licence", "key", "code",
+}
+
+
+def generate_order_id(db) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    for _ in range(10):
+        candidate = "ORD-" + "".join(secrets.choice(alphabet) for _ in range(6))
+        if not db.query(CustomerOrder.id).filter(CustomerOrder.id == candidate).first():
+            return candidate
+    raise RuntimeError("Could not generate a unique order id")
+
+
+# =====================================================================
+# Reseller authentication (with brute-force lockout)
+# =====================================================================
+
+def find_reseller_by_phone(db, phone: str) -> Optional[Reseller]:
+    norm = normalize_phone(phone)
+    if not norm:
+        return None
+    return db.query(Reseller).filter(
+        (Reseller.phone == norm) | (Reseller.phone == f"+91{norm}") | (Reseller.phone == f"91{norm}")
+    ).first()
+
+
 def verify_reseller_auth(phone: str, secret_code: str, db=None) -> Tuple[bool, Optional[Reseller], str]:
     """
-    Verifies reseller phone and 4-digit secret passcode.
-    Returns (is_valid, reseller_obj, message).
+    Returns (is_valid, reseller, message). Wrong codes count towards a temporary lockout;
+    a correct code resets the counter.
     """
-    close_when_done = False
-    if db is None:
-        db = get_db()
-        close_when_done = True
+    close_when_done = db is None
+    db = db or get_db()
     try:
-        norm_phone = normalize_phone(phone)
-        code_clean = str(secret_code).strip()
-
-        reseller = db.query(Reseller).filter(
-            (Reseller.phone == norm_phone) | (Reseller.phone == f"+91{norm_phone}") | (Reseller.phone == phone)
-        ).first()
-
+        reseller = find_reseller_by_phone(db, phone)
         if not reseller:
-            return False, None, "Reseller phone number is not registered in the system."
-        
+            return False, None, "This phone number is not registered as a reseller."
         if not reseller.is_active:
-            return False, reseller, "Reseller account is currently inactive. Please contact admin."
+            return False, reseller, "Reseller account is inactive. Please contact the admin."
+        if reseller.is_locked():
+            remaining = int((reseller.locked_until - utcnow()).total_seconds() // 60) + 1
+            return False, reseller, f"Too many failed attempts. Account locked for {remaining} more minute(s)."
 
-        if reseller.secret_code.strip() != code_clean:
-            return False, reseller, "Incorrect 4-digit secret passcode."
+        if (reseller.secret_code or "").strip() != str(secret_code or "").strip():
+            reseller.failed_attempts = (reseller.failed_attempts or 0) + 1
+            attempts_left = Config.RESELLER_MAX_FAILED_ATTEMPTS - reseller.failed_attempts
+            if attempts_left <= 0:
+                reseller.locked_until = utcnow() + datetime.timedelta(minutes=Config.RESELLER_LOCKOUT_MINUTES)
+                reseller.failed_attempts = 0
+                db.commit()
+                return False, reseller, (
+                    f"Incorrect passcode. Account locked for {Config.RESELLER_LOCKOUT_MINUTES} minutes "
+                    "for security."
+                )
+            db.commit()
+            return False, reseller, f"Incorrect 4-digit passcode. {attempts_left} attempt(s) left."
 
+        reseller.failed_attempts = 0
+        reseller.locked_until = None
+        reseller.last_login_at = utcnow()
+        db.commit()
         return True, reseller, "Authentication successful."
     finally:
         if close_when_done:
             db.close()
 
 
+# =====================================================================
+# Atomic single-use link burning
+# =====================================================================
+
+def _claim_links_in_transaction(
+    db, product_id: int, quantity: int, claimed_by_type: str, claimed_by_id: str, order_id: Optional[str]
+) -> List[InviteLink]:
+    """
+    Burns up to `quantity` links using conditional UPDATEs. Runs inside the caller's
+    transaction and does NOT commit. Returns the claimed link rows (may be fewer than
+    requested if stock ran out - caller decides whether to roll back).
+    """
+    claimed_ids: List[int] = []
+    attempts = 0
+    max_attempts = quantity * 5 + 5
+    now = utcnow()
+    raw_who = str(claimed_by_id or "")
+    # Only phone-like identifiers get normalised; session/client ids are stored verbatim.
+    who = normalize_phone(raw_who) if re.fullmatch(r"[\d+\-\s()]{6,}", raw_who) else raw_who[:100]
+
+    while len(claimed_ids) < quantity and attempts < max_attempts:
+        attempts += 1
+        candidate = (
+            db.query(InviteLink.id)
+            .filter(InviteLink.product_id == product_id, InviteLink.status == "available")
+            .order_by(InviteLink.id.asc())
+            .first()
+        )
+        if not candidate:
+            break
+        result = db.execute(
+            update(InviteLink)
+            .where(InviteLink.id == candidate.id, InviteLink.status == "available")
+            .values(
+                status="claimed",
+                claimed_by_type=claimed_by_type,
+                claimed_by_id=who,
+                claimed_at=now,
+                order_id=order_id,
+            )
+        )
+        if result.rowcount == 1:
+            claimed_ids.append(candidate.id)
+        # rowcount 0 => somebody else won that row; loop picks the next one.
+
+    if not claimed_ids:
+        return []
+    return db.query(InviteLink).filter(InviteLink.id.in_(claimed_ids)).order_by(InviteLink.id).all()
+
+
 def claim_single_use_link(
-    product_id: int, 
-    claimed_by_type: str, 
-    claimed_by_id: str, 
+    product_id: int,
+    claimed_by_type: str,
+    claimed_by_id: str,
     order_id: Optional[str] = None,
-    db=None
+    db=None,
 ) -> Tuple[bool, Optional[InviteLink], str]:
-    """
-    ATOMIC SINGLE-USE LINK BURNING:
-    Selects 1 available link for the given product, immediately marks it as 'claimed'
-    with timestamp and recipient identifier.
-    Guarantees the link will never be given out again.
-    """
-    close_when_done = False
-    if db is None:
-        db = get_db()
-        close_when_done = True
+    """Burn exactly one link and commit. Used by admin fulfilment and tests."""
+    close_when_done = db is None
+    db = db or get_db()
     try:
-        # Atomic selection with SQLite update
-        link = db.query(InviteLink).filter(
-            InviteLink.product_id == product_id,
-            InviteLink.status == "available"
-        ).order_by(InviteLink.id.asc()).first()
-
-        if not link:
-            return False, None, "Out of stock! No available single-use invite links for this product."
-
-        # Mark claimed immediately (burn link)
-        link.status = "claimed"
-        link.claimed_by_type = claimed_by_type
-        link.claimed_by_id = normalize_phone(claimed_by_id) or str(claimed_by_id)
-        link.claimed_at = datetime.datetime.utcnow()
-        link.order_id = order_id
-
-        db.commit()
-        db.refresh(link)
-        return True, link, "Link successfully claimed."
-    except Exception as e:
+        with _CLAIM_LOCK:
+            links = _claim_links_in_transaction(db, product_id, 1, claimed_by_type, claimed_by_id, order_id)
+            if not links:
+                db.rollback()
+                return False, None, "Out of stock! No available single-use invite links for this product."
+            db.commit()
+        return True, links[0], "Link successfully claimed."
+    except Exception as exc:
         db.rollback()
-        return False, None, f"Database error claiming link: {str(e)}"
+        logger.exception("claim_single_use_link failed")
+        return False, None, f"Database error claiming link: {exc}"
     finally:
         if close_when_done:
             db.close()
 
 
-def process_reseller_claim(
-    phone: str, 
-    secret_code: str, 
-    product_id_or_slug: Any, 
-    quantity: int = 1,
-    db=None
-) -> Dict[str, Any]:
+# =====================================================================
+# Reseller claim workflow
+# =====================================================================
+
+def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: int, db) -> Dict[str, Any]:
     """
-    Full Reseller Claim Workflow:
-    1. Authenticate reseller (phone + 4-digit code)
-    2. Check product and credit cost
-    3. Check available credits balance
-    4. Check inventory stock
-    5. Deduct credits atomically
-    6. Burn / Claim single-use links
-    7. Record credit transaction
-    8. Return secure links
+    Core reseller claim for an already-authenticated reseller. One transaction:
+      deduct credits (guarded) -> burn links -> write audit rows -> commit.
+    Any failure rolls back everything, so credits are never lost without links.
     """
-    close_when_done = False
-    if db is None:
-        db = get_db()
-        close_when_done = True
     try:
-        is_auth, reseller, msg = verify_reseller_auth(phone, secret_code, db=db)
-        if not is_auth:
-            return {
-                "success": False,
-                "error": "AUTH_FAILED",
-                "message": msg
-            }
+        quantity = 1 if quantity is None else int(quantity)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "INVALID_QUANTITY", "message": "Quantity must be a whole number."}
+    if quantity < 1:
+        return {"success": False, "error": "INVALID_QUANTITY", "message": "Quantity must be at least 1."}
+    if quantity > Config.MAX_CLAIM_QUANTITY:
+        return {
+            "success": False,
+            "error": "INVALID_QUANTITY",
+            "message": f"You can claim at most {Config.MAX_CLAIM_QUANTITY} links per request.",
+        }
 
-        # Find product
-        product = None
-        if isinstance(product_id_or_slug, int) or (isinstance(product_id_or_slug, str) and product_id_or_slug.isdigit()):
-            product = db.query(Product).filter(Product.id == int(product_id_or_slug), Product.is_active == True).first()
-        else:
-            product = db.query(Product).filter(
-                (Product.slug.ilike(f"%{product_id_or_slug}%")) | (Product.name.ilike(f"%{product_id_or_slug}%")),
-                Product.is_active == True
-            ).first()
+    total_credits_needed = product.credit_cost * quantity
 
-        if not product:
-            return {
-                "success": False,
-                "error": "PRODUCT_NOT_FOUND",
-                "message": f"Product '{product_id_or_slug}' not found or is currently inactive."
-            }
-
-        total_credits_needed = product.credit_cost * quantity
-        if reseller.credits_balance < total_credits_needed:
-            return {
-                "success": False,
-                "error": "INSUFFICIENT_CREDITS",
-                "message": f"Insufficient credits. You have {reseller.credits_balance} credits, but {total_credits_needed} credits are required ({product.credit_cost} credits x {quantity}).",
-                "credits_balance": reseller.credits_balance,
-                "credits_required": total_credits_needed
-            }
-
-        # Check stock
-        available_count = product.get_available_stock_count(db)
-        if available_count < quantity:
-            return {
-                "success": False,
-                "error": "OUT_OF_STOCK",
-                "message": f"Only {available_count} link(s) currently available in stock. Requested {quantity}.",
-                "available_stock": available_count
-            }
-
-        # Claim links and deduct credits atomically
-        claimed_links = []
-        for _ in range(quantity):
-            ok, link_obj, lmsg = claim_single_use_link(
-                product_id=product.id,
-                claimed_by_type="reseller",
-                claimed_by_id=reseller.phone,
-                order_id=f"RES-{reseller.id}-{int(datetime.datetime.utcnow().timestamp())}",
-                db=db
+    try:
+        with _CLAIM_LOCK:
+            # 1. Guarded credit deduction - fails atomically if balance is too low.
+            result = db.execute(
+                update(Reseller)
+                .where(
+                    Reseller.id == reseller.id,
+                    Reseller.is_active == True,  # noqa: E712
+                    Reseller.credits_balance >= total_credits_needed,
+                )
+                .values(credits_balance=Reseller.credits_balance - total_credits_needed, updated_at=utcnow())
             )
-            if not ok or not link_obj:
+            if result.rowcount != 1:
                 db.rollback()
-                return {"success": False, "error": "CLAIM_ERROR", "message": lmsg}
-            claimed_links.append(link_obj)
+                db.refresh(reseller)
+                return {
+                    "success": False,
+                    "error": "INSUFFICIENT_CREDITS",
+                    "message": (
+                        f"Insufficient credits. You have {reseller.credits_balance} credit(s), but "
+                        f"{total_credits_needed} are required ({product.credit_cost} x {quantity})."
+                    ),
+                    "credits_balance": reseller.credits_balance,
+                    "credits_required": total_credits_needed,
+                }
 
-        # Deduct wallet credits
-        reseller.credits_balance -= total_credits_needed
-        reseller.updated_at = datetime.datetime.utcnow()
+            # 2. Burn links.
+            order_ref = f"RES-{reseller.id}-{int(utcnow().timestamp())}"
+            links = _claim_links_in_transaction(db, product.id, quantity, "reseller", reseller.phone, order_ref)
+            if len(links) < quantity:
+                db.rollback()
+                available = product.get_available_stock_count(db)
+                return {
+                    "success": False,
+                    "error": "OUT_OF_STOCK",
+                    "message": f"Only {available} link(s) currently in stock for {product.name}. Requested {quantity}. No credits were deducted.",
+                    "available_stock": available,
+                }
 
-        # Record transaction log
-        for cl in claimed_links:
-            txn = CreditTransaction(
-                reseller_id=reseller.id,
-                amount=-product.credit_cost,
-                balance_after=reseller.credits_balance,
-                reason="claim_link",
-                product_id=product.id,
-                link_id=cl.id,
-                reference_note=f"Redeemed 1 single-use link for {product.name}"
-            )
-            db.add(txn)
+            # 3. Audit trail.
+            db.refresh(reseller)
+            balance_after = reseller.credits_balance
+            for link in links:
+                db.add(CreditTransaction(
+                    reseller_id=reseller.id,
+                    amount=-product.credit_cost,
+                    balance_after=balance_after,
+                    reason="claim_link",
+                    product_id=product.id,
+                    link_id=link.id,
+                    reference_note=f"Redeemed 1 single-use link for {product.name} ({order_ref})",
+                ))
+            db.commit()
 
-        db.commit()
-        db.refresh(reseller)
-
+        logger.info("Reseller %s claimed %d x %s (balance now %d)", reseller.phone, quantity, product.slug, balance_after)
         return {
             "success": True,
             "message": f"Successfully claimed {quantity} link(s) for {product.name}!",
             "product_name": product.name,
             "quantity": quantity,
             "credits_deducted": total_credits_needed,
-            "remaining_credits": reseller.credits_balance,
-            "links": [cl.link_or_key for cl in claimed_links],
-            "links_claimed_ids": [cl.id for cl in claimed_links],
-            "reseller_name": reseller.name
+            "remaining_credits": balance_after,
+            "links": [l.link_or_key for l in links],
+            "links_claimed_ids": [l.id for l in links],
+            "reseller_name": reseller.name,
+            "reseller_phone": reseller.phone,
         }
-    except Exception as e:
+    except Exception as exc:
         db.rollback()
-        return {"success": False, "error": "SERVER_ERROR", "message": f"An error occurred: {str(e)}"}
+        logger.exception("process_reseller_claim_for failed")
+        return {"success": False, "error": "SERVER_ERROR", "message": f"An error occurred: {exc}"}
+
+
+def process_reseller_claim(phone: str, secret_code: str, product_id_or_slug: Any, quantity: int = 1, db=None) -> Dict[str, Any]:
+    """Authenticate, resolve product, then run the atomic claim."""
+    close_when_done = db is None
+    db = db or get_db()
+    try:
+        is_auth, reseller, msg = verify_reseller_auth(phone, secret_code, db=db)
+        if not is_auth:
+            return {"success": False, "error": "AUTH_FAILED", "message": msg}
+        product = find_product(db, product_id_or_slug)
+        if not product:
+            return {"success": False, "error": "PRODUCT_NOT_FOUND", "message": f"Product '{product_id_or_slug}' not found or inactive."}
+        return process_reseller_claim_for(reseller, product, quantity, db)
     finally:
         if close_when_done:
             db.close()
 
 
-def init_db():
-    """Initializes tables and seeds initial data if empty."""
+# =====================================================================
+# Customer order fulfilment
+# =====================================================================
+
+def is_payment_ref_used(db, payment_ref: str, exclude_order_id: Optional[str] = None) -> bool:
+    """A UTR may only ever fulfil one order (prevents replaying one payment)."""
+    ref = str(payment_ref or "").strip()
+    if not ref or ref.upper() == "ADMIN_APPROVED":
+        return False
+    q = db.query(CustomerOrder.id).filter(func.upper(CustomerOrder.payment_ref) == ref.upper())
+    if exclude_order_id:
+        q = q.filter(CustomerOrder.id != exclude_order_id)
+    return q.first() is not None
+
+
+def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "customer") -> Dict[str, Any]:
+    """
+    Mark an order paid and deliver exactly one burned link. Idempotent: a delivered order
+    returns its existing link instead of burning another.
+    """
+    ref = str(payment_ref or "").strip()
+
+    if order.status == "delivered" and order.delivered_link_content:
+        return {
+            "success": True,
+            "already_delivered": True,
+            "order_id": order.id,
+            "product_name": order.product.name if order.product else "Digital Product",
+            "link": order.delivered_link_content,
+            "message": f"Order {order.id} was already fulfilled.",
+        }
+    if order.status == "cancelled":
+        return {"success": False, "error": "ORDER_CANCELLED", "message": f"Order {order.id} was cancelled."}
+    if is_payment_ref_used(db, ref, exclude_order_id=order.id):
+        return {
+            "success": False,
+            "error": "PAYMENT_REF_REUSED",
+            "message": "This payment reference has already been used for another order. Please share the correct UTR.",
+        }
+
+    try:
+        with _CLAIM_LOCK:
+            links = _claim_links_in_transaction(
+                db, order.product_id, 1, "customer",
+                order.customer_phone or order.session_id or order.id, order.id,
+            )
+            if not links:
+                # Keep the payment on record so the admin can fulfil manually.
+                order.payment_ref = ref or order.payment_ref
+                order.paid_at = order.paid_at or utcnow()
+                order.status = "fulfillment_pending"
+                db.commit()
+                return {
+                    "success": False,
+                    "error": "OUT_OF_STOCK",
+                    "order_id": order.id,
+                    "message": (
+                        f"Payment reference {ref} recorded for order {order.id}, but stock is momentarily exhausted. "
+                        "The admin has been notified and will deliver your link shortly."
+                    ),
+                }
+            link = links[0]
+            order.payment_ref = ref or order.payment_ref
+            order.paid_at = order.paid_at or utcnow()
+            order.delivered_at = utcnow()
+            order.status = "delivered"
+            order.delivered_link_id = link.id
+            order.delivered_link_content = link.link_or_key
+            db.commit()
+        logger.info("Order %s fulfilled by %s (ref=%s)", order.id, actor, ref)
+        return {
+            "success": True,
+            "already_delivered": False,
+            "order_id": order.id,
+            "product_name": order.product.name if order.product else "Digital Product",
+            "link": link.link_or_key,
+            "payment_ref": order.payment_ref,
+            "message": "Payment confirmed and single-use link delivered.",
+        }
+    except Exception as exc:
+        db.rollback()
+        logger.exception("fulfill_order failed")
+        return {"success": False, "error": "SERVER_ERROR", "message": str(exc)}
+
+
+def get_pending_order_for_session(db, session_id: str) -> Optional[CustomerOrder]:
+    if not session_id:
+        return None
+    return (
+        db.query(CustomerOrder)
+        .filter(CustomerOrder.session_id == session_id, CustomerOrder.status == "pending_payment")
+        .order_by(CustomerOrder.created_at.desc())
+        .first()
+    )
+
+
+# =====================================================================
+# Schema bootstrap & light migrations
+# =====================================================================
+
+def _ensure_columns() -> None:
+    """
+    `create_all` never alters existing tables. Add any columns that newer versions
+    introduced so an existing SQLite/Postgres database keeps working after upgrade.
+    """
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in inspector.get_table_names():
+                continue
+            existing = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing:
+                    continue
+                col_type = column.type.compile(dialect=engine.dialect)
+                conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {column.name} {col_type}'))
+                logger.info("Migrated: added column %s.%s", table.name, column.name)
+    # `create_all` skips existing tables entirely, so newly declared indexes need an explicit pass.
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            index.create(bind=engine, checkfirst=True)
+
+
+def init_db() -> None:
+    """Create tables, apply light migrations, seed demo data on first run."""
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()
     db = SessionLocal()
     try:
-        # Check if products exist
         if db.query(Product).count() == 0:
             seed_data(db)
+            logger.info("Seeded demo products, links and resellers.")
     finally:
         db.close()
 
 
-def seed_data(db):
-    """Seed sample digital products, invite links, resellers, and settings."""
-    settings = SystemSettings(
+def seed_data(db) -> None:
+    """Demo catalogue so the app is usable immediately. Replace via the admin dashboard."""
+    db.merge(SystemSettings(
         id=1,
         business_name="AI Digital Vending Hub",
-        admin_upi_id="resellerpay@upi",
-        admin_upi_name="Digital Hub Admin",
-        reseller_credit_rate_inr=150.0,
-        reseller_terms="🌟 *Reseller Pricing & Rules*:\n• 1 Credit = 1 Digital Product Invite Link\n• 10 Credits Pack = ₹1,500\n• 50 Credits Pack = ₹6,500 (Save ₹1,000!)\n• 100 Credits Pack = ₹12,000 (VIP Reseller Rate)\n\nTo purchase credits, pay via UPI to `resellerpay@upi` and share payment screenshot with Admin.",
-        evolution_api_url="http://localhost:8080",
-        evolution_api_key="B6D711FCDE4D4FD5936544120E713976",
-        evolution_instance_name="VendingBot",
-        openai_model_name="gpt-4o-mini"
-    )
-    db.merge(settings)
+        admin_upi_id=Config.ADMIN_UPI_ID,
+        admin_upi_name=Config.ADMIN_UPI_NAME,
+        reseller_credit_rate_inr=Config.RESELLER_CREDIT_RATE_INR,
+        reseller_terms=(
+            "🌟 *Reseller Pricing & Rules*:\n"
+            "• 1 Credit = 1 Digital Product Invite Link\n"
+            "• 10 Credits Pack = ₹1,500\n"
+            "• 50 Credits Pack = ₹6,500 (Save ₹1,000!)\n"
+            "• 100 Credits Pack = ₹12,000 (VIP Reseller Rate)\n\n"
+            f"To purchase credits, pay via UPI to `{Config.ADMIN_UPI_ID}` and share the payment screenshot with Admin."
+        ),
+        evolution_api_url=Config.EVOLUTION_API_URL,
+        evolution_api_key=Config.EVOLUTION_API_KEY,
+        evolution_instance_name=Config.EVOLUTION_INSTANCE_NAME,
+        openai_model_name=Config.OPENAI_MODEL_NAME,
+    ))
 
-    # Products with Base Price (cost) and dynamic Margin %
-    p1 = Product(
-        name="Gemini Advanced (1-Year Invite Link)",
-        slug="gemini-advanced-1y",
-        category="AI Models",
-        description="Google One AI Premium 2TB cloud storage + Gemini 1.5 Pro/2.0 Ultra access. Full 1-year private family invite link.",
-        base_price=450.0,
-        margin_percent=40.0, # Selling price = 450 + 180 = Rs 630
-        credit_cost=1,
-        is_active=True
-    )
-    p2 = Product(
-        name="Claude Pro (Private Organization Invite)",
-        slug="claude-pro-invite",
-        category="AI Models",
-        description="Claude 3.5 Sonnet & Claude 3 Opus unlimited access with Artifacts and Projects workspace.",
-        base_price=600.0,
-        margin_percent=35.0, # Selling price = 600 + 210 = Rs 810
-        credit_cost=1,
-        is_active=True
-    )
-    p3 = Product(
-        name="ChatGPT Plus (1-Month Workspace Seat)",
-        slug="chatgpt-plus-1m",
-        category="AI Models",
-        description="GPT-4o, GPT-o1 reasoning model, DALL-E 3 image generation, and custom GPTs access.",
-        base_price=350.0,
-        margin_percent=45.0, # Selling price = 350 + 157.5 = Rs 507.50
-        credit_cost=1,
-        is_active=True
-    )
-    p4 = Product(
-        name="Canva Pro (Lifetime Edu Invite)",
-        slug="canva-pro-lifetime",
-        category="Design Tools",
-        description="Full access to 100M+ premium assets, magic AI resize, background remover, and brand kit.",
-        base_price=100.0,
-        margin_percent=100.0, # Selling price = 100 + 100 = Rs 200
-        credit_cost=1,
-        is_active=True
-    )
-    p5 = Product(
-        name="Office 365 (5-Device Enterprise Account)",
-        slug="office-365-5devices",
-        category="Productivity",
-        description="Word, Excel, PowerPoint, Outlook + 5TB OneDrive storage for 5 devices (Windows/Mac/iOS/Android).",
-        base_price=200.0,
-        margin_percent=50.0, # Selling price = 200 + 100 = Rs 300
-        credit_cost=1,
-        is_active=True
-    )
-
-    db.add_all([p1, p2, p3, p4, p5])
+    products = [
+        Product(name="Gemini Advanced (1-Year Invite Link)", slug="gemini-advanced-1y", category="AI Models",
+                description="Google One AI Premium 2TB cloud storage + Gemini Pro/Ultra access. Full 1-year private family invite link.",
+                base_price=450.0, margin_percent=40.0, credit_cost=1),
+        Product(name="Claude Pro (Private Organization Invite)", slug="claude-pro-invite", category="AI Models",
+                description="Claude Sonnet & Opus access with Artifacts and Projects workspace.",
+                base_price=600.0, margin_percent=35.0, credit_cost=1),
+        Product(name="ChatGPT Plus (1-Month Workspace Seat)", slug="chatgpt-plus-1m", category="AI Models",
+                description="GPT-4o, o1 reasoning model, DALL-E 3 image generation, and custom GPTs access.",
+                base_price=350.0, margin_percent=45.0, credit_cost=1),
+        Product(name="Canva Pro (Lifetime Edu Invite)", slug="canva-pro-lifetime", category="Design Tools",
+                description="Full access to 100M+ premium assets, magic AI resize, background remover, and brand kit.",
+                base_price=100.0, margin_percent=100.0, credit_cost=1),
+        Product(name="Office 365 (5-Device Enterprise Account)", slug="office-365-5devices", category="Productivity",
+                description="Word, Excel, PowerPoint, Outlook + 5TB OneDrive storage for 5 devices.",
+                base_price=200.0, margin_percent=50.0, credit_cost=1),
+    ]
+    db.add_all(products)
     db.commit()
+    p1, p2, p3, p4, p5 = products
 
-    # Seed Sample Single-Use Invite Links
     links_data = [
         (p1.id, "https://families.google.com/join/invite?token=GM_ADV_9921_XKL89"),
         (p1.id, "https://families.google.com/join/invite?token=GM_ADV_3381_QPZ44"),
@@ -635,59 +929,22 @@ def seed_data(db):
         (p3.id, "https://chatgpt.com/workspace/invite/tok_cgpt_4o_tier2"),
         (p4.id, "https://www.canva.com/brand/join?token=CANVA_PRO_LIFETIME_EDU_89"),
         (p4.id, "https://www.canva.com/brand/join?token=CANVA_PRO_LIFETIME_EDU_90"),
-        (p5.id, "OFFICE365-USER: vip_user_891@cloudms.org | PASS: Win365#Pass2026")
+        (p5.id, "OFFICE365-USER: vip_user_891@cloudms.org | PASS: Win365#Pass2026"),
     ]
     for pid, lk in links_data:
         db.add(InviteLink(product_id=pid, link_or_key=lk, status="available"))
 
-    # Seed Sample Resellers
-    r1 = Reseller(
-        name="Rahul Sharma (Verified Reseller)",
-        phone="9876543210",
-        secret_code="1234",
-        credits_balance=25,
-        is_active=True,
-        notes="Top Tier Reseller - Delhi Region"
-    )
-    r2 = Reseller(
-        name="Amit Patel (Reseller Pro)",
-        phone="9123456780",
-        secret_code="8899",
-        credits_balance=10,
-        is_active=True,
-        notes="Mumbai Reseller Partner"
-    )
-    r3 = Reseller(
-        name="Pooja Verma (Tech Store)",
-        phone="9988776655",
-        secret_code="4321",
-        credits_balance=3,
-        is_active=True,
-        notes="New Reseller Account"
-    )
-    db.add_all([r1, r2, r3])
+    resellers = [
+        Reseller(name="Rahul Sharma (Verified Reseller)", phone="9876543210", secret_code="1234", credits_balance=25, notes="Top Tier Reseller - Delhi Region"),
+        Reseller(name="Amit Patel (Reseller Pro)", phone="9123456780", secret_code="8899", credits_balance=10, notes="Mumbai Reseller Partner"),
+        Reseller(name="Pooja Verma (Tech Store)", phone="9988776655", secret_code="4321", credits_balance=3, notes="New Reseller Account"),
+    ]
+    db.add_all(resellers)
     db.commit()
 
-    # Add initial credit transaction logs for seeded resellers
-    db.add(CreditTransaction(
-        reseller_id=r1.id,
-        amount=25,
-        balance_after=25,
-        reason="admin_topup",
-        reference_note="Initial account onboarding credits"
-    ))
-    db.add(CreditTransaction(
-        reseller_id=r2.id,
-        amount=10,
-        balance_after=10,
-        reason="admin_topup",
-        reference_note="Initial account onboarding credits"
-    ))
-    db.add(CreditTransaction(
-        reseller_id=r3.id,
-        amount=3,
-        balance_after=3,
-        reason="admin_topup",
-        reference_note="Initial account onboarding credits"
-    ))
+    for r in resellers:
+        db.add(CreditTransaction(
+            reseller_id=r.id, amount=r.credits_balance, balance_after=r.credits_balance,
+            reason="admin_topup", reference_note="Initial account onboarding credits",
+        ))
     db.commit()

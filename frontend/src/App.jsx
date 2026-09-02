@@ -10,7 +10,10 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [activeView, setActiveView] = useState('chat'); // 'chat' or 'admin'
-  const [userType, setUserType] = useState('customer'); // 'customer' or 'reseller'
+  const [sidebarOpen, setSidebarOpen] = useState(false); // mobile drawer
+  // No manual persona: the assistant asks whether the user is a customer or reseller,
+  // and the backend promotes the session to 'reseller' once a passcode is verified.
+  const userType = 'customer';
 
   // Load chat sessions on startup
   const fetchSessions = async () => {
@@ -32,9 +35,6 @@ export default function App() {
     try {
       const data = await chatApi.getHistory(sessionId);
       setMessages(data.messages || []);
-      if (data.session?.user_type) {
-        setUserType(data.session.user_type);
-      }
     } catch (err) {
       console.error('Failed to load history:', err);
     }
@@ -47,6 +47,7 @@ export default function App() {
   const handleSelectSession = (sessionId) => {
     setActiveSessionId(sessionId);
     fetchHistory(sessionId);
+    setSidebarOpen(false); // close drawer on mobile after picking a chat
   };
 
   const handleNewSession = async () => {
@@ -56,6 +57,7 @@ export default function App() {
       setActiveSessionId(newSess.id);
       setMessages([]);
       setActiveView('chat');
+      setSidebarOpen(false);
     } catch (err) {
       console.error('Failed to create new session:', err);
     }
@@ -129,19 +131,32 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen bg-slate-950 font-sans text-slate-100 overflow-hidden">
-      {/* ChatGPT-style Left Sidebar */}
-      <Sidebar
-        sessions={sessions}
-        activeSessionId={activeSessionId}
-        onSelectSession={handleSelectSession}
-        onNewSession={handleNewSession}
-        onDeleteSession={handleDeleteSession}
-        activeView={activeView}
-        setActiveView={setActiveView}
-        userType={userType}
-        setUserType={setUserType}
-      />
+    <div className="flex h-[100dvh] bg-[#212121] font-sans text-[#ececec] overflow-hidden">
+      {/* Mobile backdrop when the drawer is open */}
+      {sidebarOpen && (
+        <div
+          onClick={() => setSidebarOpen(false)}
+          className="fixed inset-0 z-30 bg-black/60 backdrop-blur-sm md:hidden"
+        />
+      )}
+
+      {/* Sidebar: static on desktop, slide-in drawer on mobile */}
+      <div
+        className={`fixed z-40 h-[100dvh] md:static md:z-auto md:translate-x-0 transition-transform duration-300 ease-out ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        <Sidebar
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          onSelectSession={handleSelectSession}
+          onNewSession={handleNewSession}
+          onDeleteSession={handleDeleteSession}
+          activeView={activeView}
+          setActiveView={setActiveView}
+          onClose={() => setSidebarOpen(false)}
+        />
+      </div>
 
       {/* Main View Area */}
       {activeView === 'chat' ? (
@@ -149,13 +164,14 @@ export default function App() {
           messages={messages}
           onSendMessage={handleSendMessage}
           loading={loading}
-          userType={userType}
-          setUserType={setUserType}
           currentSessionId={activeSessionId}
+          onOpenSidebar={() => setSidebarOpen(true)}
+          onNewSession={handleNewSession}
         />
       ) : (
         <AdminDashboard
           onSwitchToChat={() => setActiveView('chat')}
+          onOpenSidebar={() => setSidebarOpen(true)}
         />
       )}
     </div>

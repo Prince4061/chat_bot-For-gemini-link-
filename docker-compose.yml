@@ -1,0 +1,22 @@
+services:
+  vending-bot:
+    build: .
+    container_name: vending-deep-agent
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      TRUST_PROXY: "true"
+    volumes:
+      - vending_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  vending_data:

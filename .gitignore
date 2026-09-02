@@ -20,6 +20,12 @@ ENV/
 # Agent workspace artifacts
 agent_workspace/
 
+# Logs & test caches
+logs/
+*.log
+.pytest_cache/
+tests/__pycache__/
+
 # Node / React
 frontend/node_modules/
 frontend/.oxlintrc.json
@@ -32,3 +38,6 @@ yarn-error.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# Claude Code local
+.claude/

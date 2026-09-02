@@ -1,14 +1,28 @@
 @echo off
 title AI Digital Vending Deep Agent
 echo ============================================================
-echo  Starting AI Digital Vending Deep Agent & React Frontend...
+echo  AI Digital Vending Deep Agent
 echo ============================================================
 echo.
-echo 1. Starting Flask Server on port 5000...
-start cmd /k "python app.py"
 
-echo 2. Opening React Application in Browser...
-timeout /t 2 >nul
+if not exist ".env" (
+  echo [!] .env not found. Copying .env.example -> .env
+  copy .env.example .env >nul
+  echo     Edit .env and set ADMIN_API_KEY + OPENAI_API_KEY, then run again.
+  pause
+  exit /b 1
+)
+
+if not exist "frontend\dist\index.html" (
+  echo [1/2] Building React frontend...
+  pushd frontend
+  call npm install
+  call npm run build
+  popd
+)
+
+echo [2/2] Starting server (APP_ENV from .env; production uses waitress)...
+start "Vending Deep Agent Server" cmd /k "python app.py"
+timeout /t 3 >nul
 start http://127.0.0.1:5000
-
-echo Application is running at http://127.0.0.1:5000
+echo Running at http://127.0.0.1:5000

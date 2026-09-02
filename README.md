@@ -1,143 +1,139 @@
-# 🤖 AI Deep Agent: Automated Digital Product Vending & Reseller Management System
+# 🤖 AI Deep Agent — Digital Product Vending & Reseller Management
 
-An enterprise-grade, autonomous AI Deep Agent built with **Flask**, **LangChain**, **LangGraph**, and **OpenAI GPT-4o / GPT-4o-mini**, paired with a **ChatGPT-style React Frontend** and **Admin Control Dashboard**.
+Production-ready autonomous sales agent built with **Flask + LangGraph + OpenAI**, a **ChatGPT-style React UI**, an **authenticated Admin Dashboard**, and a **WhatsApp (Evolution API) channel**.
 
----
+It sells digital products (Gemini Advanced, Claude Pro, ChatGPT Plus, Canva Pro, Office 365, …) as **single-use invite links**:
 
-## 🌟 Core Features & Architecture
-
-### 1. 🛍️ Customer Flow (Dynamic Pricing & UPI Delivery)
-- **Role Detection:** Bot dynamically identifies whether the user is a Regular Customer or Reseller.
-- **Dynamic Pricing Engine:** Calculates selling price in real-time from database:
-  $$\text{Customer Selling Price} = \text{Base Price} + \left(\text{Base Price} \times \frac{\text{Admin Margin \%}}{100}\right)$$
-- **Payment & Delivery:** Generates structured UPI/QR payment instructions (`admin_upi_id`). Customer submits 12-digit UTR to instantly receive their private single-use invite link.
-
-### 2. 🔑 Reseller Flow (4-Digit Passcode & Instant Link Burning)
-- **2-Factor Verification:** Requires registered **Phone Number** + **4-Digit Secret Passcode** (e.g. `Phone: 9876543210, Code: 1234`).
-- **Wallet Credits Balance:** Checks live credits (1 Credit = 1 Single-Use Link).
-- **Atomic Link Burning (Single-Use Guarantee):**
-  - Atomically marks the link as **Burned / Claimed** with recipient phone and timestamp.
-  - Guarantees the link can **never be redistributed to anyone else**.
-  - Automatically deducts credits and logs the transaction.
-- **Unregistered Reseller Onboarding:** If verification fails, explains bulk credit packages (e.g. 10 Credits = ₹1,500) and provides Admin UPI payment info to buy credits.
-
-### 3. ⚙️ Full Admin Control Dashboard (React)
-- **Products & Margin Control:** Change live Margin % (e.g. 30% to 50%) and the Deep Agent quotes the new price to customers in the very next turn.
-- **Single-Use Links Inventory:** Bulk upload 50+ invite links/keys via multi-line textarea with real-time stock counters and claim audit logs.
-- **Reseller Management:** Add resellers, set/reset 4-digit passcodes, and top-up or deduct wallet credits.
-- **Customer Orders & UPI Approvals:** Approve pending UPI orders with 1-click single-use link fulfillment.
-- **Evolution API (WhatsApp) Webhook & Live Simulator:** Test incoming WhatsApp webhook payloads directly in the browser.
+* **Customers** browse live prices (base + admin margin %), pay via UPI, send the UTR, and receive a link instantly.
+* **Resellers** verify with phone + 4-digit passcode and claim links against a credit wallet (1 credit = 1 link).
+* **Admin** controls products, margins, stock, resellers, orders and settings from the dashboard.
 
 ---
 
-## 🚀 Quick Start Guide
+## ✨ What makes it production-grade
+
+| Area | Guarantee |
+|------|-----------|
+| **Atomic link burning** | Conditional `UPDATE … WHERE status='available'` + rowcount check — two concurrent claims can never receive the same link (SQLite *and* Postgres). Covered by a concurrency test. |
+| **Transactional credits** | Credits are deducted with `WHERE credits_balance >= n`; if stock runs out mid-claim everything rolls back — credits are never lost. |
+| **Session-aware Deep Agent** | Tools know the conversation: a verified reseller stays verified (no repeated passcode prompts), orders are tied to the session, a UTR fulfils *this* conversation's order only, and one UTR can never be reused. |
+| **Safe fallback** | No OpenAI key / LLM outage → deterministic Hindi/Hinglish rule engine using the same atomic DB operations. If the LLM fails *after* tools ran, business logic is never re-executed. |
+| **Admin auth** | Open by default (no key). Set an optional `ADMIN_API_KEY` to require `X-Admin-Token` on every `/api/admin/*` route. Secrets are always returned masked. |
+| **Client isolation** | Each browser only sees its own chat sessions (`X-Client-Id`); WhatsApp sessions are admin-only. |
+| **Brute-force protection** | Reseller passcodes lock after N failed attempts; admin can unlock. |
+| **Hardened webhook** | Optional shared secret, per-message-id de-duplication, async processing so Evolution always gets a fast 200. |
+| **Ops** | Rate limiting, security headers, JSON error handlers, rotating logs, health endpoint, waitress/gunicorn, Dockerfile, light DB migrations, pytest suite. |
+
+---
+
+## 🚀 Quick start
 
 ### Prerequisites
-- Python 3.10+
-- Node.js 18+ (Node 25 tested)
+* Python 3.10+ · Node.js 18+
 
-### 1. Backend Setup (Flask + Deep Agent)
-
+### 1. Configure
 ```bash
-# Clone or navigate to the project directory
-cd "G:\Chat_BOT\Chat BOt"
+cp .env.example .env
+```
+Everything has a sensible default. Optionally set:
+```
+OPENAI_API_KEY=sk-...                   # optional – without it the rule engine answers
+ADMIN_API_KEY=<long random string>      # optional – leave empty for an open admin dashboard
+```
 
-# Install Python dependencies
+### 2. Install & build
+```bash
 pip install -r requirements.txt
-
-# Configure your .env file
-# Add your OpenAI API key in .env or via the Admin Dashboard UI
+cd frontend && npm install && npm run build && cd ..
 ```
 
-### 2. Start the Application
-
-You can run the application in two ways:
-
-#### Option A: Unified Server (Serves both React UI and API on Port 5000)
+### 3. Run
 ```bash
 python app.py
 ```
-Open **[http://127.0.0.1:5000](http://127.0.0.1:5000)** in your browser!
+Open **http://127.0.0.1:5000** → chat as a customer/reseller, or open **Admin** (no login unless you set `ADMIN_API_KEY`).
 
-#### Option B: Developer Mode (Vite Hot-Reload + Flask Backend)
-**Terminal 1 (Backend):**
+On Windows you can simply double-click `start_all.bat`.
+
+**Developer mode (hot reload):** `python app.py` in one terminal, `cd frontend && npm run dev` in another → http://localhost:3000.
+
+### 4. Tests
 ```bash
-python app.py
-```
-**Terminal 2 (Frontend):**
-```bash
-cd frontend
-npm run dev
-```
-Open **[http://localhost:3000](http://localhost:3000)** for live hot-reload development.
-
----
-
-## 📱 Evolution API (WhatsApp) Integration
-
-The bot is designed to be 100% platform-independent.
-
-### Webhook Endpoint:
-```
-POST http://YOUR_SERVER_IP:5000/api/webhook/evolution
-```
-- Subscribe to event: `MESSAGES_UPSERT`
-- The system parses incoming WhatsApp messages, matches user sessions by phone number, invokes the Deep Agent, and automatically sends the response back to WhatsApp via Evolution API's `/message/sendText` endpoint.
-
----
-
-## 📁 Project Structure
-
-```
-├── agent.md                    # Global Deep Agent memory & rules
-├── agent_core.py               # Deep Agent execution runner (OpenAI LLM + LangGraph)
-├── agent_tools.py              # LangChain tools (pricing, auth, link dispenser, orders)
-├── app.py                      # Flask REST API, chat endpoints, admin endpoints & webhooks
-├── database.py                 # SQLite + SQLAlchemy models & atomic link claiming
-├── evolution_service.py        # WhatsApp Evolution API integration service
-├── requirements.txt            # Python dependencies
-├── deep_agents/                # Deep Agent implementation
-│   ├── __init__.py
-│   ├── agent.py                # create_deep_agent with write_todos planning
-│   └── backends.py             # FileSystemBackend, StateBackend, StoreBackend
-└── frontend/                   # React + Vite + Tailwind CSS + Lucide
-    ├── src/
-    │   ├── App.jsx             # Main ChatGPT layout controller
-    │   ├── components/
-    │   │   ├── Sidebar.jsx     # ChatGPT-style sidebar & session manager
-    │   │   ├── ChatView.jsx    # Interactive conversation interface
-    │   │   ├── MessageItem.jsx # Rich message, single-use link badge & QR pay
-    │   │   ├── PaymentModal.jsx# Dynamic UPI QR Code modal
-    │   │   ├── AdminDashboard.jsx # Admin control center
-    │   │   ├── ProductManager.jsx # Dynamic margin slider & products
-    │   │   ├── InventoryManager.jsx # Bulk link upload & claim audit trail
-    │   │   ├── ResellerManager.jsx  # Reseller passcodes & wallet credits
-    │   │   ├── OrderManager.jsx     # Customer orders & UTR approvals
-    │   │   ├── SettingsManager.jsx  # Admin UPI & OpenAI credentials
-    │   │   └── EvolutionSimulator.jsx # WhatsApp live webhook simulator
+python -m pytest tests -q
 ```
 
 ---
 
-## 🔑 Default Seeded Demo Accounts
+## 🏭 Production deployment
 
-### Sample Resellers:
-1. **Rahul Sharma (Verified Reseller)**
-   - Phone: `9876543210`
-   - Secret Code: `1234`
-   - Credits: `25`
-2. **Amit Patel (Reseller Pro)**
-   - Phone: `9123456780`
-   - Secret Code: `8899`
-   - Credits: `10`
-3. **Pooja Verma (Tech Store)**
-   - Phone: `9988776655`
-   - Secret Code: `4321`
-   - Credits: `3`
+1. In `.env` set `APP_ENV=production`, a strong `ADMIN_API_KEY`, a `SECRET_KEY`, explicit `CORS_ORIGINS`, and (recommended) `EVOLUTION_WEBHOOK_SECRET`. Start-up **refuses to run** in production with unsafe values.
+2. Run behind a reverse proxy (nginx/Caddy) with HTTPS and set `TRUST_PROXY=true`.
+3. Server options:
+   * `python app.py` → serves with **waitress** automatically when `APP_ENV=production`.
+   * Linux: `gunicorn --workers 1 --threads 16 --timeout 120 app:app`
+   * Docker: `docker compose up -d --build` (data persisted in the `vending_data` volume).
+4. Database: SQLite (WAL) is fine for one server. For multiple workers/servers set `DATABASE_URL=postgresql+psycopg://…` and `pip install "psycopg[binary]"`. Existing databases are migrated automatically on start.
+5. Back up `vending_bot.db` (or your Postgres) — it holds inventory, wallets and the audit trail.
 
-### Sample Products:
-- **Gemini Advanced (1-Year Invite Link)**: Base: ₹450 | Margin: 40% | Live Price: ₹630 | Cost: 1 Credit
-- **Claude Pro (Private Org Invite)**: Base: ₹600 | Margin: 35% | Live Price: ₹810 | Cost: 1 Credit
-- **ChatGPT Plus (1-Month Workspace)**: Base: ₹350 | Margin: 45% | Live Price: ₹507.50 | Cost: 1 Credit
-- **Canva Pro (Lifetime Edu Invite)**: Base: ₹100 | Margin: 100% | Live Price: ₹200 | Cost: 1 Credit
-- **Office 365 (5-Device Enterprise)**: Base: ₹200 | Margin: 50% | Live Price: ₹300 | Cost: 1 Credit
+> Keep **one worker process** with SQLite. Rate limits, the agent cache and webhook de-duplication are per process; use Postgres before scaling out.
+
+---
+
+## 📱 WhatsApp via Evolution API
+
+Webhook URL to configure in Evolution Manager (event `MESSAGES_UPSERT`):
+```
+https://YOUR_DOMAIN/api/webhook/evolution?token=<EVOLUTION_WEBHOOK_SECRET>
+```
+Set `EVOLUTION_API_URL`, `EVOLUTION_API_KEY`, `EVOLUTION_INSTANCE_NAME` in `.env` or the dashboard. Replies are sent through `/message/sendText/{instance}` (v1 and v2 payloads), long replies are chunked, markdown is converted to WhatsApp formatting. Test without a phone from **Admin → WhatsApp Simulator**.
+
+---
+
+## 🧠 How the Deep Agent works
+
+```
+user message ─► run_deep_agent_chat()
+                 ├─ per-session lock, history window, session context
+                 │    (verified reseller, pending order, platform, time)
+                 ├─ LangGraph loop: agent ─► tools ─► agent … (bounded)
+                 │    tools: catalog · pricing · verify · credits · claim ·
+                 │           order · confirm payment · order status · onboarding
+                 └─ persist reply + metadata (engine, tools used, plan)
+```
+
+* `agent.md` — the agent's operating rules (edit to change behaviour; reloaded automatically).
+* `agent_core.py` — engine, caching, context building, rule-based fallback.
+* `agent_tools.py` — session-aware LangChain tools (`agent_context.py` carries the session).
+* `deep_agents/` — the graph, `write_todos` planning (persisted in state), backends.
+* `database.py` — models + all atomic operations (`process_reseller_claim_for`, `fulfill_order`, …).
+* `app.py` — REST API, auth, rate limits, webhook. `config.py` — all environment settings.
+
+---
+
+## 🔐 Default demo data (first run only)
+
+| Reseller | Phone | Code | Credits |
+|----------|-------|------|---------|
+| Rahul Sharma | 9876543210 | 1234 | 25 |
+| Amit Patel | 9123456780 | 8899 | 10 |
+| Pooja Verma | 9988776655 | 4321 | 3 |
+
+Products: Gemini Advanced ₹630 · Claude Pro ₹810 · ChatGPT Plus ₹507.50 · Canva Pro ₹200 · Office 365 ₹300 (all 1 credit for resellers). Replace them in **Admin → Products** before going live.
+
+---
+
+## 🔌 API overview
+
+| Route | Auth | Purpose |
+|-------|------|---------|
+| `POST /api/chat` | client id | Talk to the agent |
+| `GET /api/chat/sessions`, `GET /api/chat/history/:id` | client id | Own conversations |
+| `POST /api/admin/login` | — | Validate admin key |
+| `GET /api/admin/metrics`, `/agent/status`, `POST /agent/test` | admin | Dashboard & LLM diagnostics |
+| `/api/admin/products[/…/margin]` | admin | Catalogue & live margin |
+| `/api/admin/inventory[/bulk-upload]` | admin | Single-use link stock (duplicates skipped) |
+| `/api/admin/resellers[/…/credits|unlock]` | admin | Resellers, wallets, lockouts |
+| `/api/admin/orders[/…/approve|cancel]` | admin | Orders & manual fulfilment |
+| `/api/admin/settings` | admin | UPI, OpenAI, Evolution settings |
+| `POST /api/webhook/evolution` | secret | WhatsApp inbound |
+| `GET /api/health` | — | Liveness + engine info |
