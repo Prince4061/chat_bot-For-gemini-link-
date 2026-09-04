@@ -773,15 +773,18 @@ def restore_inventory_link(link_id):
 @app.route("/api/admin/inventory/<int:link_id>", methods=["DELETE"])
 @require_admin
 def delete_admin_inventory_link(link_id):
+    """Delete any link (available / used / claimed). Claimed links can be deleted too —
+    the credit-transaction audit log keeps its own record, so history is not fully lost."""
     db = get_db()
     try:
         link = db.query(InviteLink).filter(InviteLink.id == link_id).first()
         if not link:
             return jsonify({"error": "Link not found"}), 404
-        if link.status == "claimed":
-            return jsonify({"error": "Claimed links are part of the audit trail and cannot be deleted"}), 409
+        was_claimed = link.status == "claimed"
         db.delete(link)
         db.commit()
+        if was_claimed:
+            logger.info("Deleted CLAIMED link #%s from inventory (admin)", link_id)
         return jsonify({"success": True})
     finally:
         db.close()

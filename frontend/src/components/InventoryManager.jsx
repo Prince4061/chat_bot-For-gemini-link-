@@ -106,7 +106,7 @@ export default function InventoryManager() {
   };
 
   const handleDelete = async (id) => {
-    if (!confirm('Are you sure you want to delete this link from inventory?')) return;
+    if (!confirm('Is link ko inventory se delete karein? Ye action wapas nahi hoga.')) return;
     try {
       await adminApi.deleteInventoryItem(id);
       loadData();

@@ -79,10 +79,14 @@ def test_bulk_upload_skips_duplicates(client, admin_headers, fresh_product):
     assert r["added_count"] == 1 and r["skipped_duplicates"] == 2
 
 
-def test_claimed_links_cannot_be_deleted(client, admin_headers, db, fresh_product):
+def test_claimed_links_can_be_deleted(client, admin_headers, db, fresh_product):
+    # Admin is allowed to delete a claimed link (they own their data).
     ok, link, _ = dbm.claim_single_use_link(fresh_product.id, "customer", "x", None, db=db)
     assert ok
-    assert client.delete(f"/api/admin/inventory/{link.id}", headers=admin_headers).status_code == 409
+    link_id = link.id  # capture before the row is deleted
+    assert client.delete(f"/api/admin/inventory/{link_id}", headers=admin_headers).status_code == 200
+    db.expire_all()
+    assert db.query(dbm.InviteLink).filter_by(id=link_id).first() is None
 
 
 def test_webhook_secret_enforced(client, monkeypatch):
