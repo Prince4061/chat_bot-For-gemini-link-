@@ -111,6 +111,24 @@ def test_whatsapp_registered_number_auto_verifies_reseller(db, fresh_product, fr
     assert "Claimed & Burned" in out2["message"] or "link" in out2["message"].lower()
 
 
+def test_whatsapp_clears_stale_reseller_link_for_unregistered_number(db, fresh_reseller):
+    """An unregistered number whose session was previously (wrongly) linked to a reseller
+    must be cleared automatically on the next message — no reseller name/balance shown."""
+    from agent_core import run_deep_agent_chat
+    sid = "wa_5559998888"          # this number is NOT a reseller
+    # Simulate the old-bug state: session linked to a real reseller.
+    db.add(dbm.ChatSessionRecord(id=sid, platform="whatsapp", customer_phone="5559998888",
+                                 reseller_id=fresh_reseller.id, reseller_phone=fresh_reseller.phone,
+                                 user_type="reseller"))
+    db.commit()
+    out = run_deep_agent_chat(sid, "balance batao", platform="whatsapp",
+                              owner_id="wa:5559998888", customer_phone="5559998888")
+    db.expire_all()
+    rec = db.query(dbm.ChatSessionRecord).filter_by(id=sid).first()
+    assert rec.reseller_id is None and rec.user_type == "customer"
+    assert fresh_reseller.name not in out["message"]
+
+
 def test_whatsapp_unregistered_number_gets_contact_guidance(db):
     from agent_core import run_deep_agent_chat
     s = dbm.get_settings(db); s.admin_contact_number = "+919000000123"; db.commit()

@@ -315,16 +315,27 @@ def run_deep_agent_chat(
                     session_rec.customer_name = customer_name
                 if user_type_hint and session_rec.user_type != "reseller":
                     session_rec.user_type = user_type_hint
-            # 1b. WhatsApp auto-verify: the sender's number IS their identity, so a
-            #     registered reseller is verified automatically - no phone/passcode asked.
-            if platform == "whatsapp" and not session_rec.reseller_id and session_rec.customer_phone:
-                reseller = find_reseller_by_phone(db, session_rec.customer_phone)
+            # 1b. WhatsApp identity = sender's number. Re-derive EVERY turn so it always
+            #     reflects the current DB: verify a registered reseller, and CLEAR any stale
+            #     reseller link if this number is not (or no longer) a registered reseller.
+            #     (Fixes old sessions that got linked to a reseller by a typed phone+code.)
+            if platform == "whatsapp":
+                reseller = find_reseller_by_phone(db, session_rec.customer_phone) if session_rec.customer_phone else None
                 if reseller and reseller.is_active and not reseller.is_locked():
-                    session_rec.reseller_id = reseller.id
-                    session_rec.reseller_phone = reseller.phone
-                    session_rec.reseller_verified_at = utcnow()
-                    session_rec.user_type = "reseller"
-                    logger.info("WhatsApp auto-verified reseller %s by number", reseller.phone)
+                    if session_rec.reseller_id != reseller.id:
+                        session_rec.reseller_id = reseller.id
+                        session_rec.reseller_phone = reseller.phone
+                        session_rec.reseller_verified_at = utcnow()
+                        session_rec.user_type = "reseller"
+                        logger.info("WhatsApp auto-verified reseller %s by number", reseller.phone)
+                elif session_rec.reseller_id:
+                    # Stale link from an earlier typed phone+code, or reseller removed → clear it.
+                    logger.info("Clearing stale reseller link on WhatsApp session %s (number %s not a reseller)",
+                                session_id, session_rec.customer_phone)
+                    session_rec.reseller_id = None
+                    session_rec.reseller_phone = None
+                    session_rec.reseller_verified_at = None
+                    session_rec.user_type = "customer"
 
             session_rec.updated_at = utcnow()
             db.add(ChatMessageRecord(session_id=session_id, role="user", content=user_message))
