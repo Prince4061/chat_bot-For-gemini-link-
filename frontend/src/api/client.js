@@ -139,6 +139,13 @@ export const adminApi = {
   getSettings: async () => (await api.get('/admin/settings')).data,
   updateSettings: async (settingsData) => (await api.post('/admin/settings', settingsData)).data,
 
+  // AI training (Knowledge Base / FAQ)
+  getKnowledge: async () => (await api.get('/admin/knowledge')).data,
+  createKnowledge: async (entry) => (await api.post('/admin/knowledge', entry)).data,
+  updateKnowledge: async (id, entry) => (await api.put(`/admin/knowledge/${id}`, entry)).data,
+  deleteKnowledge: async (id) => (await api.delete(`/admin/knowledge/${id}`)).data,
+  testKnowledge: async (question) => (await api.post('/admin/knowledge/test', { question })).data,
+
   simulateEvolutionWhatsApp: async (phone, message, name = 'WhatsApp User') =>
     (await api.post('/webhook/simulate', { phone, message, name })).data
 };

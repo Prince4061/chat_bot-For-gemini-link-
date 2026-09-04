@@ -43,6 +43,7 @@ from database import (  # noqa: E402  (config must load first)
     CustomerOrder,
     ChatSessionRecord,
     ChatMessageRecord,
+    KnowledgeEntry,
     fulfill_order,
     normalize_phone,
     is_valid_secret_code,
@@ -1032,10 +1033,106 @@ def update_system_settings_api():
         if "openai_model_name" in data:
             s.openai_model_name = str(data["openai_model_name"]).strip()[:50] or "gpt-4o-mini"
             llm_changed = True
+        if "agent_instructions" in data:
+            s.agent_instructions = str(data["agent_instructions"])[:8000]
+            llm_changed = True  # trained instructions change the prompt -> rebuild agent
         db.commit()
         if llm_changed:
             invalidate_agent_cache()
         return jsonify(s.to_dict())
+    finally:
+        db.close()
+
+
+# =====================================================================
+# Admin: AI training (Knowledge Base / FAQ)
+# =====================================================================
+
+@app.route("/api/admin/knowledge", methods=["GET"])
+@require_admin
+def list_knowledge():
+    db = get_db()
+    try:
+        rows = db.query(KnowledgeEntry).order_by(KnowledgeEntry.priority.desc(), KnowledgeEntry.id.desc()).all()
+        return jsonify([k.to_dict() for k in rows])
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/knowledge", methods=["POST"])
+@require_admin
+def create_knowledge():
+    data = _payload()
+    question = str(data.get("question", "")).strip()
+    answer = str(data.get("answer", "")).strip()
+    if not question or not answer:
+        return jsonify({"error": "question and answer are required"}), 400
+    db = get_db()
+    try:
+        entry = KnowledgeEntry(
+            question=question[:2000],
+            answer=answer[:4000],
+            keywords=str(data.get("keywords", ""))[:500],
+            priority=int(data.get("priority", 0) or 0),
+            is_active=bool(data.get("is_active", True)),
+        )
+        db.add(entry)
+        db.commit()
+        invalidate_agent_cache()
+        return jsonify(entry.to_dict()), 201
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/knowledge/<int:entry_id>", methods=["PUT"])
+@require_admin
+def update_knowledge(entry_id):
+    data = _payload()
+    db = get_db()
+    try:
+        entry = db.query(KnowledgeEntry).filter(KnowledgeEntry.id == entry_id).first()
+        if not entry:
+            return jsonify({"error": "Entry not found"}), 404
+        if "question" in data: entry.question = str(data["question"]).strip()[:2000]
+        if "answer" in data: entry.answer = str(data["answer"]).strip()[:4000]
+        if "keywords" in data: entry.keywords = str(data["keywords"])[:500]
+        if "priority" in data: entry.priority = int(data["priority"] or 0)
+        if "is_active" in data: entry.is_active = bool(data["is_active"])
+        db.commit()
+        invalidate_agent_cache()
+        return jsonify(entry.to_dict())
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/knowledge/<int:entry_id>", methods=["DELETE"])
+@require_admin
+def delete_knowledge(entry_id):
+    db = get_db()
+    try:
+        entry = db.query(KnowledgeEntry).filter(KnowledgeEntry.id == entry_id).first()
+        if not entry:
+            return jsonify({"error": "Entry not found"}), 404
+        db.delete(entry)
+        db.commit()
+        invalidate_agent_cache()
+        return jsonify({"success": True})
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/knowledge/test", methods=["POST"])
+@require_admin
+def test_knowledge():
+    """Try a question against the trained FAQ (shows which entry would answer)."""
+    from database import match_knowledge
+    q = str(_payload().get("question", "")).strip()
+    if not q:
+        return jsonify({"error": "question required"}), 400
+    db = get_db()
+    try:
+        entry = match_knowledge(db, q)
+        return jsonify({"matched": bool(entry), "entry": entry.to_dict() if entry else None})
     finally:
         db.close()
 

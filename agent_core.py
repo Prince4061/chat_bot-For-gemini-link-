@@ -38,6 +38,8 @@ from database import (
     generate_order_id,
     verify_reseller_auth,
     find_reseller_by_phone,
+    get_active_knowledge,
+    match_knowledge,
     process_reseller_claim_for,
     fulfill_order,
     get_pending_order_for_session,
@@ -120,6 +122,36 @@ def load_agent_memory() -> str:
     return "You are an AI Autonomous Digital Product Vending and Reseller Management Deep Agent."
 
 
+def build_full_system_prompt(db=None) -> str:
+    """agent.md + admin-trained custom instructions + Knowledge Base (FAQ), so the admin
+    can shape how the bot replies without touching code."""
+    close = db is None
+    db = db or get_db()
+    try:
+        parts = [load_agent_memory()]
+        settings = get_settings(db)
+        instructions = (settings.agent_instructions or "").strip()
+        if instructions:
+            parts.append("## Additional Admin Instructions (follow these)\n" + instructions)
+
+        kb = get_active_knowledge(db)
+        if kb:
+            lines = [
+                "## Knowledge Base — admin-trained answers",
+                "When the user's question matches one of these, answer using the given answer "
+                "(paraphrase naturally, keep facts/prices/links exact). If none match, answer normally.",
+            ]
+            for e in kb[:80]:
+                q = " ".join((e.question or "").split())[:300]
+                a = " ".join((e.answer or "").split())[:800]
+                lines.append(f"\nQ: {q}\nA: {a}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+    finally:
+        if close:
+            db.close()
+
+
 def resolve_llm_settings(db=None) -> Dict[str, str]:
     """Admin-dashboard settings win over environment variables."""
     close = db is None
@@ -163,7 +195,7 @@ def get_deep_agent():
     llm_cfg = resolve_llm_settings()
     if not llm_key_looks_valid(llm_cfg["api_key"]):
         return None
-    prompt = load_agent_memory()
+    prompt = build_full_system_prompt()   # includes admin instructions + trained FAQ
     signature = hashlib.sha256(f"{llm_cfg['api_key']}|{llm_cfg['model']}|{prompt}".encode("utf-8")).hexdigest()
 
     with _AGENT_CACHE_LOCK:
@@ -631,6 +663,12 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             f"2. Pay ₹{price:,.2f} to `{settings.admin_upi_id}` (note: {order.id})\n"
             "3. Reply here with your 12-digit UTR / transaction ID to get your private invite link instantly."
         )
+
+    # 5b. Admin-trained FAQ / knowledge base (answers general questions the flows above
+    #     didn't handle — refund/delivery/how-to-pay/etc., trained from the admin panel).
+    kb = match_knowledge(db, user_message)
+    if kb:
+        return kb.answer
 
     # 6. Greeting / help (platform-aware)
     if is_whatsapp:

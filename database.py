@@ -311,6 +311,8 @@ class SystemSettings(Base):
     evolution_instance_name = Column(String(100), default=Config.EVOLUTION_INSTANCE_NAME)
     openai_api_key = Column(String(200), nullable=True)
     openai_model_name = Column(String(50), default=Config.OPENAI_MODEL_NAME)
+    # Free-text extra instructions the admin trains the agent with (persona, rules, tone...).
+    agent_instructions = Column(Text, default="")
 
     @staticmethod
     def _mask(value: Optional[str]) -> Optional[str]:
@@ -335,6 +337,7 @@ class SystemSettings(Base):
             "openai_model_name": self.openai_model_name,
             "openai_api_key": self._mask(self.openai_api_key),
             "has_openai_key": bool(self.openai_api_key or Config.OPENAI_API_KEY),
+            "agent_instructions": self.agent_instructions or "",
         }
 
 
@@ -401,6 +404,40 @@ class ChatMessageRecord(Base):
         }
 
 
+class KnowledgeEntry(Base):
+    """
+    Admin-trained Q&A / FAQ. The bot uses these to answer matching questions:
+    the LLM gets them as reference material, and the rule engine matches on keywords.
+    """
+    __tablename__ = "knowledge_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    question = Column(Text, nullable=False)             # the example question / topic
+    answer = Column(Text, nullable=False)               # how the bot should reply
+    keywords = Column(Text, default="")                 # comma/newline separated trigger words
+    priority = Column(Integer, default=0)               # higher = matched first
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+    def keyword_list(self) -> List[str]:
+        raw = self.keywords or ""
+        parts = re.split(r"[,\n;]+", raw)
+        return [p.strip().lower() for p in parts if p.strip()]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "question": self.question,
+            "answer": self.answer,
+            "keywords": self.keywords or "",
+            "priority": self.priority or 0,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 # =====================================================================
 # Helpers
 # =====================================================================
@@ -447,6 +484,54 @@ def get_settings(db=None) -> SystemSettings:
     finally:
         if close_when_done:
             db.close()
+
+
+_STOPWORDS = {
+    "the", "and", "for", "you", "your", "kya", "hai", "hain", "kaise", "kaisa", "mera", "meri",
+    "main", "mujhe", "aap", "how", "what", "when", "where", "can", "please", "will", "with",
+    "about", "koi", "hoga", "karo", "karna", "chahiye", "chahta", "batao", "bata",
+}
+
+
+def get_active_knowledge(db, limit: int = 200) -> List["KnowledgeEntry"]:
+    return (
+        db.query(KnowledgeEntry)
+        .filter(KnowledgeEntry.is_active == True)  # noqa: E712
+        .order_by(KnowledgeEntry.priority.desc(), KnowledgeEntry.id.asc())
+        .limit(limit)
+        .all()
+    )
+
+
+def match_knowledge(db, message: str) -> Optional["KnowledgeEntry"]:
+    """
+    Return the best-matching active knowledge entry for a user message, or None.
+    Matches on admin keywords first; falls back to significant words of the question.
+    Requires at least one solid keyword hit so it never hijacks unrelated messages.
+    """
+    text = (message or "").lower()
+    if not text.strip():
+        return None
+    best, best_score = None, 0
+    for entry in get_active_knowledge(db):
+        kws = entry.keyword_list()
+        if not kws:
+            # derive keywords from the question itself
+            kws = [w for w in re.findall(r"[a-z0-9]+", (entry.question or "").lower())
+                   if len(w) >= 4 and w not in _STOPWORDS]
+        score = 0
+        for kw in kws:
+            if not kw:
+                continue
+            # phrase keyword (has space) -> substring; single word -> word-boundary match
+            if " " in kw:
+                if kw in text:
+                    score += 2
+            elif re.search(rf"\b{re.escape(kw)}\b", text):
+                score += 1
+        if score > best_score:
+            best, best_score = entry, score
+    return best if best_score >= 1 else None
 
 
 def find_product(db, name_or_slug_or_id: Any, active_only: bool = True) -> Optional[Product]:
