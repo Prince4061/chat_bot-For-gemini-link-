@@ -20,7 +20,7 @@ COPY . .
 COPY --from=frontend /app/frontend/dist ./frontend/dist
 
 # SQLite file, agent workspace and logs live on a volume
-RUN mkdir -p /data && useradd -r -u 1001 vending && chown -R vending:vending /app /data
+RUN mkdir -p /data/logs /data/agent_workspace && useradd -r -u 1001 vending && chown -R vending:vending /app /data && chmod -R 777 /data
 USER vending
 ENV DATABASE_URL=sqlite:////data/vending_bot.db AGENT_WORKSPACE_DIR=/data/agent_workspace LOG_FILE=/data/logs/app.log
 

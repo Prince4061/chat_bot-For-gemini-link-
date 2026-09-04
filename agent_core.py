@@ -37,6 +37,7 @@ from database import (
     find_product,
     generate_order_id,
     verify_reseller_auth,
+    find_reseller_by_phone,
     process_reseller_claim_for,
     fulfill_order,
     get_pending_order_for_session,
@@ -230,17 +231,30 @@ def build_session_context_text(db, session_rec: ChatSessionRecord) -> str:
     if session_rec.customer_name or session_rec.customer_phone:
         lines.append(f"- Known customer: {session_rec.customer_name or 'Customer'} {session_rec.customer_phone or ''}".rstrip())
 
+    is_whatsapp = session_rec.platform == "whatsapp"
+    contact = (settings.admin_contact_number or "").strip()
+
     reseller = None
     if session_rec.reseller_id:
         reseller = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
     if reseller and reseller.is_active and not reseller.is_locked():
+        how = "auto-verified by their WhatsApp number" if is_whatsapp else "verified in this conversation"
         lines.append(
-            f"- RESELLER VERIFIED in this conversation: {reseller.name} (phone {reseller.phone}), "
-            f"wallet balance {reseller.credits_balance} credit(s). Do NOT ask for phone/passcode again; "
-            "call claim_reseller_product_link(product_name, quantity) or check_reseller_credits() directly."
+            f"- RESELLER VERIFIED ({how}): {reseller.name} (phone {reseller.phone}), "
+            f"wallet balance {reseller.credits_balance} credit(s). Do NOT ask for phone or passcode; "
+            "call check_reseller_credits() or claim_reseller_product_link(product_name, quantity) directly."
+        )
+    elif is_whatsapp:
+        # On WhatsApp the sender's number is known and is NOT a registered reseller.
+        contact_line = (f"Tell them to contact {contact} to pay and get reseller access."
+                        if contact else "Tell them to contact the admin to pay and get reseller access.")
+        lines.append(
+            "- This WhatsApp number is NOT a registered reseller. Never ask them for a phone number "
+            "(you already have it) or a passcode. They can still buy as a normal customer via UPI. "
+            f"If they want reseller credits/links: {contact_line}"
         )
     else:
-        lines.append("- Reseller: NOT verified. Links can only be claimed after phone + 4-digit passcode verification.")
+        lines.append("- Reseller: NOT verified. On web, links are claimed only after phone + 4-digit passcode verification.")
 
     pending = get_pending_order_for_session(db, session_rec.id)
     if pending:
@@ -300,6 +314,17 @@ def run_deep_agent_chat(
                     session_rec.customer_name = customer_name
                 if user_type_hint and session_rec.user_type != "reseller":
                     session_rec.user_type = user_type_hint
+            # 1b. WhatsApp auto-verify: the sender's number IS their identity, so a
+            #     registered reseller is verified automatically - no phone/passcode asked.
+            if platform == "whatsapp" and not session_rec.reseller_id and session_rec.customer_phone:
+                reseller = find_reseller_by_phone(db, session_rec.customer_phone)
+                if reseller and reseller.is_active and not reseller.is_locked():
+                    session_rec.reseller_id = reseller.id
+                    session_rec.reseller_phone = reseller.phone
+                    session_rec.reseller_verified_at = utcnow()
+                    session_rec.user_type = "reseller"
+                    logger.info("WhatsApp auto-verified reseller %s by number", reseller.phone)
+
             session_rec.updated_at = utcnow()
             db.add(ChatMessageRecord(session_id=session_id, role="user", content=user_message))
             db.commit()
@@ -469,13 +494,28 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
     msg = user_message.lower().strip()
     settings = get_settings(db)
     session_id = session_rec.id
+    is_whatsapp = session_rec.platform == "whatsapp"
+    contact = (settings.admin_contact_number or "").strip()
 
     qty_match = re.search(r"\b(\d{1,2})\s*(links?|credits?|pcs|pieces|qty)\b", msg)
     quantity = int(qty_match.group(1)) if qty_match else 1
 
-    # 1. Credentials in this message -> verify (and claim if a product is named)
-    phone_match = re.search(r"(?<!\d)(\d{10})(?!\d)", user_message)
-    code_match = re.search(r"(?<!\d)(\d{4})(?!\d)", user_message)
+    reseller_intent = any(k in msg for k in ("reseller", "credit", "wallet", "balance", "link do", "link chahiye", "claim"))
+
+    # WhatsApp: sender number is known. If it is NOT a registered reseller and they ask
+    # about reseller/credits, guide them to the admin contact instead of asking for a code.
+    if is_whatsapp and not session_rec.reseller_id and reseller_intent and not find_product(db, user_message):
+        c = f" Contact *{contact}* to pay and get reseller access." if contact else " Please contact the admin to pay and get reseller access."
+        return (
+            "ℹ️ Aapka ye number reseller ke roop me registered nahi hai.\n\n"
+            f"1 Credit = ₹{settings.reseller_credit_rate_inr:,.0f} (1 credit = 1 single-use link)."
+            f"{c}\n\n"
+            "Ya aap normal customer ki tarah bhi kharid sakte ho — bas product ka naam bhejo aur UPI se pay karo."
+        )
+
+    # 1. (Web only) Credentials in this message -> verify (and claim if a product is named).
+    phone_match = re.search(r"(?<!\d)(\d{10})(?!\d)", user_message) if not is_whatsapp else None
+    code_match = re.search(r"(?<!\d)(\d{4})(?!\d)", user_message) if not is_whatsapp else None
     if phone_match and code_match:
         is_auth, reseller, auth_msg = verify_reseller_auth(phone_match.group(1), code_match.group(1), db=db)
         if not is_auth:
@@ -580,7 +620,14 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             "3. Reply here with your 12-digit UTR / transaction ID to get your private invite link instantly."
         )
 
-    # 6. Greeting / help
+    # 6. Greeting / help (platform-aware)
+    if is_whatsapp:
+        return (
+            f"👋 **Welcome to {settings.business_name}!**\n\n"
+            "Product ka naam bhejo live price + kharidne ke liye (UPI se pay).\n\n"
+            "🔑 Agar aap registered reseller ho to aapke credits is number se apne aap kaam karte hain — "
+            "bas *'balance'* ya product ka naam bhejo."
+        )
     return (
         f"👋 **Welcome to {settings.business_name}!**\n\n"
         "1. 🛍️ **Customer** - say *'products'* to see live prices and buy via UPI.\n"

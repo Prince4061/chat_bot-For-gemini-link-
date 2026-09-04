@@ -948,6 +948,7 @@ def update_system_settings_api():
         if "business_name" in data: s.business_name = str(data["business_name"])[:150]
         if "admin_upi_id" in data: s.admin_upi_id = str(data["admin_upi_id"]).strip()[:100]
         if "admin_upi_name" in data: s.admin_upi_name = str(data["admin_upi_name"]).strip()[:100]
+        if "admin_contact_number" in data: s.admin_contact_number = str(data["admin_contact_number"]).strip()[:30]
         if "qr_code_image_url" in data: s.qr_code_image_url = data["qr_code_image_url"]
         if "reseller_credit_rate_inr" in data:
             try:

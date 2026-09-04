@@ -1,0 +1,26 @@
+# systemd service — bot ko background me chalata hai, crash/reboot pe auto-restart.
+# Install:
+#   sudo cp deploy/vending-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vending-bot
+# Logs dekho:  journalctl -u vending-bot -f
+# WorkingDirectory ko apne project ke asli path se badal do agar alag hai.
+
+[Unit]
+Description=AI Vending Deep Agent (Flask + Deep Agent)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/vending-bot
+EnvironmentFile=/root/vending-bot/.env
+ExecStart=/usr/bin/python3 /root/vending-bot/app.py
+Restart=always
+RestartSec=3
+# stdout/stderr -> journalctl
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

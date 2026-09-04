@@ -95,6 +95,33 @@ def test_order_tools_are_session_scoped(db, fresh_product):
         reset_session_context(token)
 
 
+def test_whatsapp_registered_number_auto_verifies_reseller(db, fresh_product, fresh_reseller):
+    from agent_core import run_deep_agent_chat
+    sid = f"wa_{fresh_reseller.phone}"
+    # No phone/passcode in the message - identity comes from the WhatsApp sender number.
+    out = run_deep_agent_chat(sid, "balance batao", platform="whatsapp",
+                              owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    assert out["success"]
+    db.expire_all()
+    rec = db.query(dbm.ChatSessionRecord).filter_by(id=sid).first()
+    assert rec.reseller_id == fresh_reseller.id and rec.user_type == "reseller"
+    # And claiming needs no passcode either.
+    out2 = run_deep_agent_chat(sid, f"{fresh_product.name} ki link do", platform="whatsapp",
+                               owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    assert "Claimed & Burned" in out2["message"] or "link" in out2["message"].lower()
+
+
+def test_whatsapp_unregistered_number_gets_contact_guidance(db):
+    from agent_core import run_deep_agent_chat
+    s = dbm.get_settings(db); s.admin_contact_number = "+919000000123"; db.commit()
+    out = run_deep_agent_chat("wa_5550001111", "mujhe reseller credits chahiye", platform="whatsapp",
+                              owner_id="wa:5550001111", customer_phone="5550001111")
+    assert "+919000000123" in out["message"]
+    db.expire_all()
+    rec = db.query(dbm.ChatSessionRecord).filter_by(id="wa_5550001111").first()
+    assert rec.reseller_id is None  # never auto-verified
+
+
 def test_catalog_tool_reports_live_margin(db, fresh_product):
     fresh_product.margin_percent = 100.0
     db.commit()

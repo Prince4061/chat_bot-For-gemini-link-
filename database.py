@@ -296,6 +296,8 @@ class SystemSettings(Base):
     business_name = Column(String(150), default="AI Digital Vending Hub")
     admin_upi_id = Column(String(100), default=Config.ADMIN_UPI_ID)
     admin_upi_name = Column(String(100), default=Config.ADMIN_UPI_NAME)
+    # WhatsApp/phone number an unregistered user is told to contact to buy credits.
+    admin_contact_number = Column(String(30), default="")
     qr_code_image_url = Column(Text, nullable=True)
     reseller_credit_rate_inr = Column(Float, default=Config.RESELLER_CREDIT_RATE_INR)
     reseller_terms = Column(Text, default="Minimum credit pack: 10 Credits (Rs 1,500). 1 Credit = 1 Single-Use Invite Link.")
@@ -318,6 +320,7 @@ class SystemSettings(Base):
             "business_name": self.business_name,
             "admin_upi_id": self.admin_upi_id,
             "admin_upi_name": self.admin_upi_name,
+            "admin_contact_number": self.admin_contact_number or "",
             "qr_code_image_url": self.qr_code_image_url,
             "reseller_credit_rate_inr": self.reseller_credit_rate_inr,
             "reseller_terms": self.reseller_terms,

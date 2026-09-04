@@ -18,6 +18,7 @@ export default function SettingsManager() {
     business_name: '',
     admin_upi_id: '',
     admin_upi_name: '',
+    admin_contact_number: '',
     reseller_credit_rate_inr: 150,
     reseller_terms: '',
     evolution_api_url: '',
@@ -152,6 +153,22 @@ export default function SettingsManager() {
                 onChange={(e) => setSettings({ ...settings, admin_upi_name: e.target.value })}
                 className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] focus:outline-none focus:border-white/15"
               />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div>
+              <label className="block text-[#8e8ea0] mb-1 font-medium">Admin Contact Number (for new resellers)</label>
+              <input
+                type="text"
+                value={settings.admin_contact_number || ''}
+                onChange={(e) => setSettings({ ...settings, admin_contact_number: e.target.value })}
+                placeholder="e.g. +91 98765 43210"
+                className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono focus:outline-none focus:border-white/15"
+              />
+              <span className="text-[11px] text-[#8e8ea0] mt-1 block">
+                Unregistered WhatsApp users ko bot yahi number deta hai — "yahan baat karke pay karke credits lo".
+              </span>
             </div>
           </div>
 

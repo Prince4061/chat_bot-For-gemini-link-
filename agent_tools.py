@@ -430,7 +430,14 @@ def get_reseller_onboarding_info() -> str:
     try:
         s = get_settings(db)
         rate = s.reseller_credit_rate_inr
+        contact = (s.admin_contact_number or "").strip()
         record_tool_call("get_reseller_onboarding_info", True)
+        join = (
+            f"1. Contact the admin{(' on ' + contact) if contact else ''} to buy a credit pack. "
+            f"2. Pay via UPI to {s.admin_upi_id} and share the screenshot. "
+            "3. Admin registers your number as a reseller. "
+            "4. After that, just message from this same number and your credits/links work automatically."
+        )
         return _json({
             "status": "success",
             "business_name": s.business_name,
@@ -442,13 +449,9 @@ def get_reseller_onboarding_info() -> str:
             ],
             "admin_upi_id": s.admin_upi_id,
             "admin_upi_name": s.admin_upi_name,
+            "admin_contact_number": contact,
             "terms": s.reseller_terms,
-            "how_to_join": (
-                f"1. Pay for a credit pack to UPI ID {s.admin_upi_id}. "
-                "2. Share the payment screenshot with the admin. "
-                "3. Admin registers the phone number and issues a 4-digit passcode. "
-                "4. Claim links 24/7 through this chat."
-            ),
+            "how_to_join": join,
         })
     finally:
         db.close()
