@@ -26,6 +26,7 @@ export default function InventoryManager() {
   const [bulkLinksText, setBulkLinksText] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
+  const [uploadErr, setUploadErr] = useState('');
   const [rechecking, setRechecking] = useState(false);
 
   const loadData = async () => {
@@ -57,13 +58,26 @@ export default function InventoryManager() {
 
     try {
       setUploading(true);
+      setUploadMsg('');
+      setUploadErr('');
       const res = await adminApi.bulkUploadInventory(selectedProductId, bulkLinksText);
-      setUploadMsg(`Successfully added ${res.added_count} single-use link(s) to ${res.product_name}!`);
-      setBulkLinksText('');
+      const added = res.added_count || 0;
+      const skipped = res.skipped_duplicates || 0;
+      if (added > 0) {
+        setUploadMsg(`✅ ${added} link(s) added to ${res.product_name}. Total available: ${res.new_available_stock}.${skipped ? ` (${skipped} duplicate skipped)` : ''}`);
+        setBulkLinksText('');
+      } else if (skipped > 0) {
+        // Nothing new — every link was already in stock.
+        setUploadErr(`⚠️ Ye link(s) pehle se stock me hain (duplicate) — kuch naya add nahi hua.`);
+      } else {
+        setUploadErr('Kuch add nahi hua. Link aur product sahi hai?');
+      }
       loadData();
-      setTimeout(() => setUploadMsg(''), 4000);
+      setTimeout(() => { setUploadMsg(''); setUploadErr(''); }, 6000);
     } catch (err) {
-      alert('Error uploading inventory: ' + err.message);
+      const status = err?.response?.status;
+      if (status === 401) setUploadErr('Unauthorized — admin token expired. Refresh karke dobara login karo.');
+      else setUploadErr('Error: ' + (err.message || 'upload failed'));
     } finally {
       setUploading(false);
     }
@@ -73,12 +87,21 @@ export default function InventoryManager() {
     try {
       setRechecking(true);
       const res = await adminApi.recheckInventory(productFilter);
-      alert(`Freshness check done.\nChecked: ${res.checked}\nFresh: ${res.fresh}\nMarked used: ${res.marked_used}`);
+      alert(`Freshness check done.\nChecked: ${res.checked}\nFresh: ${res.fresh}\nMarked used: ${res.marked_used}\nRestored: ${res.restored || 0}`);
       loadData();
     } catch (err) {
       alert('Error rechecking: ' + err.message);
     } finally {
       setRechecking(false);
+    }
+  };
+
+  const handleRestore = async (id) => {
+    try {
+      await adminApi.restoreInventoryItem(id);
+      loadData();
+    } catch (err) {
+      alert('Error restoring: ' + err.message);
     }
   };
 
@@ -192,9 +215,14 @@ export default function InventoryManager() {
         </form>
 
         {uploadMsg && (
-          <div className="mt-3 p-2.5 bg-[#2f2f2f] border border-white/15 rounded-xl text-xs text-[#ececec] flex items-center gap-2 animate-fadeIn">
-            <CheckCircle className="w-4 h-4 text-[#ececec]" />
+          <div className="mt-3 p-2.5 bg-[#2f2f2f] border border-emerald-500/30 rounded-xl text-xs text-[#ececec] flex items-center gap-2 animate-fadeIn">
+            <CheckCircle className="w-4 h-4 text-emerald-400" />
             <span>{uploadMsg}</span>
+          </div>
+        )}
+        {uploadErr && (
+          <div className="mt-3 p-2.5 bg-rose-950/40 border border-rose-500/40 rounded-xl text-xs text-rose-300 flex items-center gap-2 animate-fadeIn">
+            <span>{uploadErr}</span>
           </div>
         )}
       </div>
@@ -311,13 +339,24 @@ export default function InventoryManager() {
                       {item.claimed_at ? new Date(item.claimed_at).toLocaleString() : '—'}
                     </td>
                     <td className="py-3 px-4 text-right">
-                      <button
-                        onClick={() => handleDelete(item.id)}
-                        className="p-1 hover:text-rose-400 text-[#8e8ea0] transition-colors"
-                        title="Delete from stock"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="flex items-center justify-end gap-2">
+                        {item.status === 'used' && (
+                          <button
+                            onClick={() => handleRestore(item.id)}
+                            className="px-2 py-1 rounded-lg bg-[#3a3a3a] hover:bg-[#4a4a4a] text-emerald-300 text-[10px] font-semibold transition-colors"
+                            title="Wapas available stock me daalo"
+                          >
+                            Restore
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleDelete(item.id)}
+                          className="p-1 hover:text-rose-400 text-[#8e8ea0] transition-colors"
+                          title="Delete from stock"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))

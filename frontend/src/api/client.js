@@ -121,6 +121,7 @@ export const adminApi = {
   deleteInventoryItem: async (id) => (await api.delete(`/admin/inventory/${id}`)).data,
   recheckInventory: async (productId = '') =>
     (await api.post('/admin/inventory/recheck', productId ? { product_id: parseInt(productId) } : {})).data,
+  restoreInventoryItem: async (id) => (await api.post(`/admin/inventory/${id}/restore`)).data,
 
   getResellers: async () => (await api.get('/admin/resellers')).data,
   createReseller: async (resellerData) => (await api.post('/admin/resellers', resellerData)).data,

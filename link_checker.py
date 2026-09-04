@@ -21,15 +21,12 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Hosts/patterns that mean a Google/Gemini link is FRESH vs USED.
-_GOOGLE_FRESH_MARKERS = ("one.google.com/activate-plan", "one.google.com/about")
+# The single DEFINITIVE signal: a USED Google/Gemini link ends up on this host.
+# A FRESH link stays on one.google.com or bounces to accounts.google.com (login) —
+# both are normal. We deliberately do NOT scan page text, because Google's login/consent
+# pages contain generic phrases ("not available", etc.) that caused fresh links to be
+# wrongly flagged as used.
 _GOOGLE_USED_HOST = "serviceactivation.google.com"
-
-# Substrings in page text that indicate a consumed/invalid invite (best-effort).
-_USED_TEXT_MARKERS = (
-    "already been used", "no longer valid", "has expired", "already redeemed",
-    "link is invalid", "already claimed", "not available",
-)
 
 
 def is_checkable(url: str) -> bool:
@@ -42,7 +39,9 @@ def is_checkable(url: str) -> bool:
 def check_link_freshness(url: str) -> str:
     """
     Returns "fresh" | "used" | "unknown".
-    Network errors return "unknown" so we never block a sale on a transient failure.
+    Conservative on purpose: a link is "used" ONLY if it (originally or after redirects)
+    lands on the used-activation host. Any ambiguity or network error is "unknown", which
+    the caller hands out normally — we never block a sale on a fresh/uncertain link.
     """
     if not is_checkable(url):
         return "unknown"
@@ -57,20 +56,13 @@ def check_link_freshness(url: str) -> str:
         logger.warning("Link check failed (%s): %s", url[:60], exc)
         return "unknown"
 
-    final_url = (resp.url or "").lower()
-    body = ""
-    try:
-        body = resp.text[:20000].lower()
-    except Exception:  # noqa: BLE001
-        body = ""
+    # Check the final URL and the whole redirect chain for the used host.
+    urls = [(resp.url or "").lower()] + [(r.url or "").lower() for r in resp.history]
+    if any(_GOOGLE_USED_HOST in u for u in urls):
+        return "used"
 
-    if _GOOGLE_USED_HOST in final_url:
-        return "used"
-    if any(m in body for m in _USED_TEXT_MARKERS):
-        return "used"
-    if any(m in final_url for m in _GOOGLE_FRESH_MARKERS):
-        return "fresh"
-    # Reachable Google page that didn't bounce to the used host — treat as fresh.
+    # Reachable Google page that did NOT bounce to the used host -> fresh.
+    final_url = (resp.url or "").lower()
     if "google.com" in final_url and resp.status_code < 400:
         return "fresh"
     return "unknown"

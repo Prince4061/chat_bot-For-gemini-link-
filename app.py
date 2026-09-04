@@ -720,11 +720,13 @@ def recheck_inventory():
     product_id = data.get("product_id")
     db = get_db()
     try:
-        q = db.query(InviteLink).filter(InviteLink.status == "available")
+        # Re-check available AND previously-used links, so a link wrongly marked used
+        # (e.g. a transient page) can be restored if it now verifies as fresh.
+        q = db.query(InviteLink).filter(InviteLink.status.in_(["available", "used"]))
         if product_id and str(product_id).isdigit():
             q = q.filter(InviteLink.product_id == int(product_id))
         links = q.order_by(InviteLink.id.asc()).limit(300).all()
-        checked = fresh = used = 0
+        checked = fresh = used = restored = 0
         for lk in links:
             if not is_checkable(lk.link_or_key):
                 continue
@@ -733,13 +735,37 @@ def recheck_inventory():
             lk.health_checked_at = utcnow()
             checked += 1
             if h == "used":
-                lk.status = "used"
+                if lk.status != "used":
+                    lk.status = "used"
                 used += 1
             elif h == "fresh":
                 fresh += 1
+                if lk.status == "used":   # false positive earlier -> bring it back
+                    lk.status = "available"
+                    restored += 1
             db.commit()
-        logger.info("Inventory recheck: checked=%d fresh=%d used=%d", checked, fresh, used)
-        return jsonify({"success": True, "checked": checked, "fresh": fresh, "marked_used": used})
+        logger.info("Inventory recheck: checked=%d fresh=%d used=%d restored=%d", checked, fresh, used, restored)
+        return jsonify({"success": True, "checked": checked, "fresh": fresh, "marked_used": used, "restored": restored})
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/inventory/<int:link_id>/restore", methods=["POST"])
+@require_admin
+def restore_inventory_link(link_id):
+    """Manually return a link to available stock (e.g. it was wrongly flagged 'used')."""
+    db = get_db()
+    try:
+        link = db.query(InviteLink).filter(InviteLink.id == link_id).first()
+        if not link:
+            return jsonify({"error": "Link not found"}), 404
+        if link.status == "claimed":
+            return jsonify({"error": "Claimed links cannot be restored"}), 409
+        link.status = "available"
+        link.health = "unchecked"
+        link.health_checked_at = None
+        db.commit()
+        return jsonify({"success": True, "id": link.id, "status": link.status})
     finally:
         db.close()
 
