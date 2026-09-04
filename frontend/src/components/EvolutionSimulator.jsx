@@ -13,9 +13,11 @@ import {
 import { adminApi } from '../api/client';
 
 export default function EvolutionSimulator() {
-  const [phone, setPhone] = useState('9876543210');
-  const [userName, setUserName] = useState('Rahul Reseller');
-  const [message, setMessage] = useState('Phone: 9876543210, Code: 1234. Claim Gemini Advanced');
+  // Default to a NON-registered number so you test the real customer/unregistered flow.
+  // To test a reseller, type a registered reseller's number here (e.g. 9876543210).
+  const [phone, setPhone] = useState('9000000000');
+  const [userName, setUserName] = useState('WhatsApp User');
+  const [message, setMessage] = useState('products dikhao');
   const [loading, setLoading] = useState(false);
   const [simulationLog, setSimulationLog] = useState(null);
 
@@ -104,31 +106,31 @@ export default function EvolutionSimulator() {
                   type="button"
                   onClick={() => {
                     setPhone('9876543210');
-                    setMessage('Phone: 9876543210, Code: 1234. Claim Gemini Advanced');
+                    setMessage('gemini ki link do');
                   }}
                   className="px-2 py-1 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/10 rounded-lg text-[11px] text-[#ececec]"
                 >
-                  Reseller Claim (Gemini)
+                  Registered reseller (9876543210)
                 </button>
                 <button
                   type="button"
                   onClick={() => {
-                    setPhone('9988112233');
-                    setMessage('Hi, what products are available and what is the price?');
+                    setPhone('9000000000');
+                    setMessage('products dikhao');
                   }}
                   className="px-2 py-1 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/10 rounded-lg text-[11px] text-[#ececec]"
                 >
-                  Customer Price Inquiry
+                  New customer
                 </button>
                 <button
                   type="button"
                   onClick={() => {
-                    setPhone('9123456780');
-                    setMessage('I am reseller Amit Patel. Check my credit balance. Phone: 9123456780, Code: 8899');
+                    setPhone('9000000000');
+                    setMessage('mujhe reseller credits chahiye');
                   }}
                   className="px-2 py-1 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/10 rounded-lg text-[11px] text-amber-300"
                 >
-                  Check Credits
+                  Unregistered → reseller ask
                 </button>
               </div>
             </div>

@@ -249,9 +249,10 @@ def build_session_context_text(db, session_rec: ChatSessionRecord) -> str:
         contact_line = (f"Tell them to contact {contact} to pay and get reseller access."
                         if contact else "Tell them to contact the admin to pay and get reseller access.")
         lines.append(
-            "- This WhatsApp number is NOT a registered reseller. Never ask them for a phone number "
-            "(you already have it) or a passcode. They can still buy as a normal customer via UPI. "
-            f"If they want reseller credits/links: {contact_line}"
+            "- This WhatsApp number is NOT a registered reseller. Do NOT greet them by any reseller "
+            "name and do NOT show any credit balance or claim any link for them - they have no reseller "
+            "account. Never ask them for a phone number (you already have it) or a passcode. They can "
+            f"buy as a normal customer via UPI. If they want reseller credits/links: {contact_line}"
         )
     else:
         lines.append("- Reseller: NOT verified. On web, links are claimed only after phone + 4-digit passcode verification.")
