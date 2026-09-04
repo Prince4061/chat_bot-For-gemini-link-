@@ -145,7 +145,10 @@ class InviteLink(Base):
     id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
     link_or_key = Column(Text, nullable=False)
-    status = Column(String(20), default="available", index=True)
+    status = Column(String(20), default="available", index=True)  # available | claimed | used
+    # Freshness of the link itself (for auto-verifiable links like Gemini/Google One).
+    health = Column(String(20), default="unchecked")     # unchecked | fresh | used | unknown
+    health_checked_at = Column(DateTime, nullable=True)
     claimed_by_type = Column(String(20), nullable=True)   # "customer" | "reseller" | "admin"
     claimed_by_id = Column(String(100), nullable=True)    # phone / client id
     claimed_at = Column(DateTime, nullable=True)
@@ -162,6 +165,8 @@ class InviteLink(Base):
             "product_name": self.product.name if self.product else "Unknown",
             "link_or_key": self.link_or_key,
             "status": self.status,
+            "health": self.health or "unchecked",
+            "health_checked_at": self.health_checked_at.isoformat() if self.health_checked_at else None,
             "claimed_by_type": self.claimed_by_type,
             "claimed_by_id": self.claimed_by_id,
             "claimed_at": self.claimed_at.isoformat() if self.claimed_at else None,
@@ -601,6 +606,42 @@ def _claim_links_in_transaction(
     return db.query(InviteLink).filter(InviteLink.id.in_(claimed_ids)).order_by(InviteLink.id).all()
 
 
+def ensure_fresh_stock(db, product_id: int, max_checks: int = 12) -> Dict[str, Any]:
+    """
+    Lazily verify links AT CLAIM TIME: walk the oldest available links, and for any that
+    are verifiable (e.g. Gemini/Google One), check freshness. Mark USED links as status='used'
+    (so they are never handed out and show up in the admin panel), and stop as soon as the
+    front-most available link is fresh/unknown/non-checkable. Runs OUTSIDE the claim lock
+    (does its own commits) so we never hold a DB lock during network calls.
+    """
+    from link_checker import is_checkable, check_link_freshness  # local import: optional dep
+
+    marked_used, checked = 0, 0
+    while checked < max_checks:
+        link = (
+            db.query(InviteLink)
+            .filter(InviteLink.product_id == product_id, InviteLink.status == "available")
+            .order_by(InviteLink.id.asc())
+            .first()
+        )
+        if not link:
+            break
+        if not is_checkable(link.link_or_key):
+            break  # can't verify this type -> hand it out as-is
+        checked += 1
+        health = check_link_freshness(link.link_or_key)
+        link.health = health
+        link.health_checked_at = utcnow()
+        if health == "used":
+            link.status = "used"
+            marked_used += 1
+            db.commit()
+            continue  # try the next available link
+        db.commit()
+        break  # front link is fresh/unknown -> good to hand out
+    return {"checked": checked, "marked_used": marked_used}
+
+
 def claim_single_use_link(
     product_id: int,
     claimed_by_type: str,
@@ -652,6 +693,13 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
         }
 
     total_credits_needed = product.credit_cost * quantity
+
+    # Verify freshness lazily before claiming, so resellers only get fresh links.
+    try:
+        for _ in range(quantity):
+            ensure_fresh_stock(db, product.id)
+    except Exception:  # noqa: BLE001
+        logger.exception("ensure_fresh_stock failed (continuing with unchecked stock)")
 
     try:
         with _CLAIM_LOCK:
@@ -782,6 +830,12 @@ def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "cust
             "error": "PAYMENT_REF_REUSED",
             "message": "This payment reference has already been used for another order. Please share the correct UTR.",
         }
+
+    # Verify freshness lazily before delivering, so customers only get fresh links.
+    try:
+        ensure_fresh_stock(db, order.product_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("ensure_fresh_stock failed (continuing with unchecked stock)")
 
     try:
         with _CLAIM_LOCK:

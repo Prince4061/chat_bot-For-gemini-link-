@@ -26,6 +26,7 @@ export default function InventoryManager() {
   const [bulkLinksText, setBulkLinksText] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
+  const [rechecking, setRechecking] = useState(false);
 
   const loadData = async () => {
     try {
@@ -68,6 +69,19 @@ export default function InventoryManager() {
     }
   };
 
+  const handleRecheck = async () => {
+    try {
+      setRechecking(true);
+      const res = await adminApi.recheckInventory(productFilter);
+      alert(`Freshness check done.\nChecked: ${res.checked}\nFresh: ${res.fresh}\nMarked used: ${res.marked_used}`);
+      loadData();
+    } catch (err) {
+      alert('Error rechecking: ' + err.message);
+    } finally {
+      setRechecking(false);
+    }
+  };
+
   const handleDelete = async (id) => {
     if (!confirm('Are you sure you want to delete this link from inventory?')) return;
     try {
@@ -103,13 +117,24 @@ export default function InventoryManager() {
           </p>
         </div>
 
-        <button
-          onClick={loadData}
-          className="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl transition-colors text-xs flex items-center gap-1.5 self-start"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          Refresh Stock
-        </button>
+        <div className="flex items-center gap-2 self-start">
+          <button
+            onClick={handleRecheck}
+            disabled={rechecking}
+            title="Gemini/Google links ko abhi verify karo — used links ko 'Used' mark kar dega"
+            className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl transition-colors text-xs flex items-center gap-1.5 disabled:opacity-50"
+          >
+            <ShieldCheck className="w-3.5 h-3.5" />
+            {rechecking ? 'Checking…' : 'Recheck freshness'}
+          </button>
+          <button
+            onClick={loadData}
+            className="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl transition-colors text-xs flex items-center gap-1.5"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* Bulk Upload Section */}
@@ -186,6 +211,7 @@ export default function InventoryManager() {
             <option value="">All Statuses</option>
             <option value="available">Available in Stock</option>
             <option value="claimed">Claimed / Burned</option>
+            <option value="used">Used (dead)</option>
           </select>
 
           <select
@@ -246,9 +272,21 @@ export default function InventoryManager() {
                     </td>
                     <td className="py-3 px-4">
                       {item.status === 'available' ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#2f2f2f] text-[#ececec] border border-white/15 text-[10px] font-semibold">
-                          <CheckCircle className="w-3 h-3" />
-                          Available
+                        <div className="flex items-center gap-1.5">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#2f2f2f] text-[#ececec] border border-white/15 text-[10px] font-semibold">
+                            <CheckCircle className="w-3 h-3" />
+                            Available
+                          </span>
+                          {item.health === 'fresh' && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-500/30 text-[9px] font-semibold" title="Verified fresh">✓ Fresh</span>
+                          )}
+                          {item.health === 'unknown' && (
+                            <span className="px-1.5 py-0.5 rounded-full bg-[#3a3a3a] text-[#8e8ea0] border border-white/10 text-[9px] font-semibold" title="Could not verify">? </span>
+                          )}
+                        </div>
+                      ) : item.status === 'used' ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-950 text-rose-300 border border-rose-500/40 text-[10px] font-semibold" title="Detected as already used — not handed out">
+                          ⚠ Used (dead)
                         </span>
                       ) : (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-950 text-amber-400 border border-amber-500/30 text-[10px] font-semibold">

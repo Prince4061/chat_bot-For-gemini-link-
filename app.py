@@ -653,7 +653,7 @@ def list_admin_inventory():
     db = get_db()
     try:
         q = db.query(InviteLink)
-        if status_filter in ("available", "claimed"):
+        if status_filter in ("available", "claimed", "used"):
             q = q.filter(InviteLink.status == status_filter)
         if product_id_filter and product_id_filter.isdigit():
             q = q.filter(InviteLink.product_id == int(product_id_filter))
@@ -704,6 +704,42 @@ def bulk_upload_links():
             "product_name": product.name,
             "new_available_stock": product.get_available_stock_count(db),
         })
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/inventory/recheck", methods=["POST"])
+@require_admin
+def recheck_inventory():
+    """
+    Verify freshness of available (checkable) links now — marks used ones as 'used'
+    so they stop being handed out. Optional product_id to limit scope.
+    """
+    from link_checker import is_checkable, check_link_freshness
+    data = _payload()
+    product_id = data.get("product_id")
+    db = get_db()
+    try:
+        q = db.query(InviteLink).filter(InviteLink.status == "available")
+        if product_id and str(product_id).isdigit():
+            q = q.filter(InviteLink.product_id == int(product_id))
+        links = q.order_by(InviteLink.id.asc()).limit(300).all()
+        checked = fresh = used = 0
+        for lk in links:
+            if not is_checkable(lk.link_or_key):
+                continue
+            h = check_link_freshness(lk.link_or_key)
+            lk.health = h
+            lk.health_checked_at = utcnow()
+            checked += 1
+            if h == "used":
+                lk.status = "used"
+                used += 1
+            elif h == "fresh":
+                fresh += 1
+            db.commit()
+        logger.info("Inventory recheck: checked=%d fresh=%d used=%d", checked, fresh, used)
+        return jsonify({"success": True, "checked": checked, "fresh": fresh, "marked_used": used})
     finally:
         db.close()
 
