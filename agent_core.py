@@ -282,6 +282,11 @@ def build_session_context_text(db, session_rec: ChatSessionRecord) -> str:
             "whose price fits the balance. Do NOT ask for phone or passcode; call "
             "claim_reseller_product_link(product_name, quantity) or check_reseller_balance() directly."
         )
+        lines.append(
+            f"- AUTHORITATIVE BALANCE: {summary} is the ONLY correct, current balance. IGNORE any "
+            "credits/balance numbers that appear in earlier messages of this conversation — the old "
+            "credit system was replaced by this money wallet. Never say 'credits'; say the money amount."
+        )
         if is_whatsapp:
             lines.append(
                 "- On WhatsApp, when this reseller greets or sends a general message, reply IMMEDIATELY like "
@@ -415,7 +420,15 @@ def run_deep_agent_chat(
             token = set_session_context(ctx)
             response_text, todos, engine = "", [], "rule_based"
             try:
-                agent = get_deep_agent()
+                # Deterministic fast-path: a verified reseller's greeting / balance question is a DB
+                # FACT. Skip the LLM for it (agent=None -> rule engine answers from the live wallet),
+                # so an old "credits: 5" in chat history can never be repeated as the balance.
+                fact_reply = None
+                if session_rec.reseller_id:
+                    _r = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
+                    if _r and _r.is_active and not _r.is_locked():
+                        fact_reply = _verified_reseller_fact_reply(db, _r, user_message)
+                agent = None if fact_reply else get_deep_agent()
                 if agent is not None:
                     engine = "deep_agent"
                     context_text = build_session_context_text(db, session_rec)
@@ -531,6 +544,32 @@ def _fmt_links(links: List[str]) -> str:
     return "\n".join(f"`{l}`" for l in links)
 
 
+_GREETING_RE = re.compile(r"\W*(hi+|hello+|hey+|hii+|namaste|namaskar|start|menu|help|yo|ok|hlo)\W*")
+
+
+def _verified_reseller_fact_reply(db, reseller: Reseller, user_message: str) -> Optional[str]:
+    """
+    Deterministic reply for a verified reseller's greeting / balance question, built straight
+    from the wallet in the DB. Used BEFORE the LLM so the balance can never be hallucinated or
+    parroted from old chat history (e.g. a stale "credits: 5" from the pre-wallet era).
+    Returns None when the message is about something else (e.g. names a product).
+    """
+    msg = (user_message or "").lower().strip()
+    asks_balance = any(k in msg for k in ("balance", "credit", "wallet", "paise", "paisa", "kitna paisa", "kitne paise"))
+    is_greeting = bool(_GREETING_RE.fullmatch(msg)) or len(msg) <= 2
+    if not (asks_balance or is_greeting):
+        return None
+    if find_product(db, user_message):
+        return None
+    db.refresh(reseller)  # always the live wallet value
+    first_name = reseller.name.split(" (")[0].split()[0] if reseller.name else "Reseller"
+    return (
+        f"👋 Hello **{first_name}** sir! Aapke paas **{reseller.money()}** balance hai.\n\n"
+        "Kya aapko koi link chahiye? Bas product ka naam bhejo (jaise *'Gemini ki link do'*).\n\n"
+        f"Link prices (aapke liye):\n{_reseller_prices_lines(db, reseller)}"
+    )
+
+
 def _reseller_prices_lines(db, reseller: Reseller, limit: int = 8) -> str:
     """'• Gemini Advanced — ₹450' lines in the reseller's currency (what a link costs them)."""
     prods = db.query(Product).filter(Product.is_active == True).order_by(Product.id).limit(limit).all()  # noqa: E712
@@ -565,7 +604,8 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
     # anywhere in the message when a unit word is present (365 in "office 365" is 3 digits -> ignored).
     quantity = 1
     if re.search(r"\b(links?|credits?|pcs|pieces|qty|keys?)\b", msg):
-        qty_match = re.search(r"(?<![\d.])(\d{1,2})(?![\d.])", msg)
+        # Number must be a standalone word: "2 links" yes; "9fa56274", "gpt-4o", "x2" no.
+        qty_match = re.search(r"(?<![\w.])(\d{1,2})(?![\w.])", msg)
         if qty_match and 1 <= int(qty_match.group(1)) <= Config.MAX_CLAIM_QUANTITY:
             quantity = int(qty_match.group(1))
 
@@ -614,17 +654,11 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         reseller = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
         if reseller and reseller.is_active:
             product = find_product(db, user_message)
-            asks_balance = any(k in msg for k in ("balance", "credit", "wallet"))
-            is_greeting = bool(re.fullmatch(r"\W*(hi+|hello+|hey+|hii+|namaste|namaskar|start|menu|help|yo|ok|hlo)\W*", msg)) or len(msg) <= 2
-            # Registered reseller says "hi" (or asks balance) -> show name + per-product credits
-            # right away, no need to ask. This is the WhatsApp "number = identity" experience.
-            if (asks_balance or is_greeting) and not product:
-                first_name = reseller.name.split(" (")[0].split()[0] if reseller.name else "Reseller"
-                return (
-                    f"👋 Hello **{first_name}** sir! Aapke paas **{reseller.money()}** balance hai.\n\n"
-                    "Kya aapko koi link chahiye? Bas product ka naam bhejo (jaise *'Gemini ki link do'*).\n\n"
-                    f"Link prices (aapke liye):\n{_reseller_prices_lines(db, reseller)}"
-                )
+            # Registered reseller says "hi" (or asks balance) -> name + LIVE wallet balance from the
+            # DB right away, no need to ask. (Same helper the LLM fast-path uses.)
+            fact = _verified_reseller_fact_reply(db, reseller, user_message)
+            if fact:
+                return fact
             if product and not any(k in msg for k in _CATALOG_KEYWORDS):
                 return _reseller_claim_reply(process_reseller_claim_for(reseller, product, quantity, db))
 

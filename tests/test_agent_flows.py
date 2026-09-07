@@ -141,6 +141,22 @@ def test_whatsapp_registered_reseller_hi_shows_name_and_balance(db, fresh_produc
     assert "Link prices" in msg and "₹" in msg.split("Link prices", 1)[1]   # per-link reseller prices listed
 
 
+def test_balance_reply_uses_live_wallet_not_old_credit_history(db, fresh_product, fresh_reseller):
+    """Old chats may contain 'credits: 5' from the retired credit system. A balance question must
+    answer from the DB wallet (₹) and never mention credits."""
+    from agent_core import run_deep_agent_chat
+    sid = f"wa_hist_{fresh_reseller.phone}"
+    kw = dict(platform="whatsapp", owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    run_deep_agent_chat(sid, "hi", **kw)                                        # creates + verifies session
+    db.add(dbm.ChatMessageRecord(session_id=sid, role="assistant", content="Aapke credits (per product): • Gemini: 5"))
+    db.commit()
+    for q in ("balance batao", "mere paas kitna paisa hai", "hello"):
+        out = run_deep_agent_chat(sid, q, **kw)
+        assert "₹500.00" in out["message"], (q, out["message"])
+        assert "credit" not in out["message"].lower()
+        assert out["metadata"]["engine"].startswith("rule_based")             # fact path, not the LLM
+
+
 def test_quantity_parsed_when_number_precedes_product_name(db, fresh_product, fresh_reseller):
     """'2 <product> links do' must mean quantity 2 (₹200), not 1. With ₹500 it succeeds and
     charges for two; with only ₹150 left it is refused instead of silently giving one link."""
