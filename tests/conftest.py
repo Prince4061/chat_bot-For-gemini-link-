@@ -65,7 +65,8 @@ def fresh_product(db):
     import uuid
     # Name deliberately avoids generic words ("product", "test") that the rule engine keys on.
     slug = f"zephyr-suite-{uuid.uuid4().hex[:8]}"
-    product = dbm.Product(name=f"Zephyr Suite {slug}", slug=slug, base_price=100.0, margin_percent=50.0, credit_cost=1)
+    # reseller_price=100 -> a ₹500 wallet buys exactly 5 links
+    product = dbm.Product(name=f"Zephyr Suite {slug}", slug=slug, base_price=100.0, margin_percent=50.0, reseller_price=100.0)
     db.add(product)
     db.commit()
     for i in range(3):
@@ -77,13 +78,13 @@ def fresh_product(db):
 
 @pytest.fixture()
 def fresh_reseller(db, fresh_product):
-    """A reseller holding 5 credits for `fresh_product` ONLY (credits are per product)."""
+    """A reseller with a ₹500 INR wallet (= 5 links of `fresh_product` at ₹100 each)."""
     import uuid
     phone = "7" + uuid.uuid4().int.__str__()[:9]
-    reseller = dbm.Reseller(name="Test Reseller", phone=phone, secret_code="4321")
+    reseller = dbm.Reseller(name="Test Reseller", phone=phone, secret_code="4321", currency="INR")
     db.add(reseller)
     db.commit()
     db.refresh(reseller)
-    dbm.adjust_reseller_product_credits(db, reseller, fresh_product, 5, reason="admin_topup", note="test grant")
+    dbm.adjust_reseller_wallet(db, reseller, 500.0, reason="admin_topup", note="test grant")
     db.refresh(reseller)
     return reseller

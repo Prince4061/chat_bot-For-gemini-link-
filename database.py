@@ -7,8 +7,8 @@ Concurrency model
 * Single-use links are burned with a conditional UPDATE (`WHERE status='available'`)
   and a rowcount check, so two concurrent claims can never receive the same link -
   on SQLite (WAL + busy_timeout) and on Postgres alike.
-* Credits are deducted with `UPDATE ... WHERE credits_balance >= :n`, never with a
-  read-modify-write in Python.
+* Wallet money is deducted/added with conditional `UPDATE ... WHERE wallet_balance + :amt >= 0`,
+  never with a read-modify-write in Python.
 * Every multi-step operation runs inside one transaction and is rolled back as a whole.
 """
 import re
@@ -101,7 +101,9 @@ class Product(Base):
     description = Column(Text, default="")
     base_price = Column(Float, nullable=False, default=0.0)        # Admin cost
     margin_percent = Column(Float, nullable=False, default=30.0)   # Live margin %
-    credit_cost = Column(Integer, nullable=False, default=1)       # Credits per link for resellers
+    credit_cost = Column(Integer, nullable=False, default=1)       # legacy (credits era), unused
+    # What a RESELLER pays per link, in INR. NULL = same as base_price.
+    reseller_price = Column(Float, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
 
@@ -110,6 +112,10 @@ class Product(Base):
     def get_customer_price(self) -> float:
         """Customer price = base + base * margin% / 100 (computed live, never stored)."""
         return round(self.base_price + self.base_price * (self.margin_percent / 100.0), 2)
+
+    def get_reseller_price(self) -> float:
+        """Reseller pays this per link (INR). Defaults to the base price when not set."""
+        return round(float(self.reseller_price if self.reseller_price is not None else self.base_price), 2)
 
     def get_available_stock_count(self, session) -> int:
         return session.query(func.count(InviteLink.id)).filter(
@@ -131,6 +137,8 @@ class Product(Base):
             "margin_percent": self.margin_percent,
             "customer_price": self.get_customer_price(),
             "credit_cost": self.credit_cost,
+            "reseller_price": self.get_reseller_price(),
+            "reseller_price_set": self.reseller_price is not None,
             "is_active": self.is_active,
             "stock_count": stock,
             "in_stock": stock > 0,
@@ -191,6 +199,10 @@ class Reseller(Base):
     # Old generic wallet credits that were never tied to a product. Not claimable until the
     # admin assigns them to a product (see assign_legacy_credits).
     legacy_unassigned_credits = Column(Integer, default=0, nullable=False)
+    # MONEY WALLET (current model): balance in the reseller's currency. Each claimed link
+    # deducts the product's reseller price (converted to this currency if USD).
+    wallet_balance = Column(Float, default=0.0, nullable=False)
+    currency = Column(String(5), default="INR", nullable=False)   # INR | USD
     is_active = Column(Boolean, default=True)
     notes = Column(Text, nullable=True)
     # Brute-force protection
@@ -202,6 +214,13 @@ class Reseller(Base):
 
     transactions = relationship("CreditTransaction", back_populates="reseller", cascade="all, delete-orphan")
     product_credits = relationship("ResellerCredit", back_populates="reseller", cascade="all, delete-orphan")
+    wallet_transactions = relationship("WalletTransaction", back_populates="reseller", cascade="all, delete-orphan")
+
+    def money(self, amount: Optional[float] = None) -> str:
+        """Format an amount in this reseller's currency, e.g. ₹1,500.00 / $18.07."""
+        amt = self.wallet_balance if amount is None else amount
+        sym = "$" if (self.currency or "INR").upper() == "USD" else "₹"
+        return f"{sym}{float(amt or 0):,.2f}"
 
     def is_locked(self) -> bool:
         return bool(self.locked_until and self.locked_until > utcnow())
@@ -211,17 +230,9 @@ class Reseller(Base):
             "id": self.id,
             "name": self.name,
             "phone": self.phone,
-            "credits_balance": self.credits_balance,
-            "legacy_unassigned_credits": self.legacy_unassigned_credits or 0,
-            "product_credits": [
-                {
-                    "product_id": pc.product_id,
-                    "product_name": pc.product.name if pc.product else f"#{pc.product_id}",
-                    "slug": pc.product.slug if pc.product else None,
-                    "credits": pc.credits,
-                }
-                for pc in sorted(self.product_credits, key=lambda x: x.product_id)
-            ],
+            "wallet_balance": round(float(self.wallet_balance or 0), 2),
+            "currency": (self.currency or "INR").upper(),
+            "wallet_display": self.money(),
             "is_active": self.is_active,
             "is_locked": self.is_locked(),
             "failed_attempts": self.failed_attempts or 0,
@@ -253,6 +264,42 @@ class ResellerCredit(Base):
 
     reseller = relationship("Reseller", back_populates="product_credits")
     product = relationship("Product")
+
+
+class WalletTransaction(Base):
+    """Money ledger for reseller wallets: top-ups, deductions, link purchases, migrations."""
+    __tablename__ = "wallet_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    reseller_id = Column(Integer, ForeignKey("resellers.id"), nullable=False, index=True)
+    amount = Column(Float, nullable=False)          # + top-up / - deduction, in `currency`
+    balance_after = Column(Float, nullable=False)
+    currency = Column(String(5), default="INR")
+    reason = Column(String(50), nullable=False)     # admin_topup | admin_deduct | purchase | link_purchase | migration
+    product_id = Column(Integer, nullable=True)
+    link_id = Column(Integer, nullable=True)
+    reference_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    reseller = relationship("Reseller", back_populates="wallet_transactions")
+
+    def to_dict(self) -> Dict[str, Any]:
+        sym = "$" if (self.currency or "INR").upper() == "USD" else "₹"
+        return {
+            "id": self.id,
+            "reseller_id": self.reseller_id,
+            "reseller_name": self.reseller.name if self.reseller else "Unknown",
+            "reseller_phone": self.reseller.phone if self.reseller else "Unknown",
+            "amount": round(float(self.amount), 2),
+            "amount_display": f"{'+' if self.amount >= 0 else '-'}{sym}{abs(float(self.amount)):,.2f}",
+            "balance_after": round(float(self.balance_after), 2),
+            "currency": (self.currency or "INR").upper(),
+            "reason": self.reason,
+            "product_id": self.product_id,
+            "link_id": self.link_id,
+            "reference_note": self.reference_note,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
 
 
 class CreditTransaction(Base):
@@ -342,7 +389,8 @@ class SystemSettings(Base):
     # WhatsApp/phone number an unregistered user is told to contact to buy credits.
     admin_contact_number = Column(String(30), default="")
     qr_code_image_url = Column(Text, nullable=True)
-    reseller_credit_rate_inr = Column(Float, default=Config.RESELLER_CREDIT_RATE_INR)
+    reseller_credit_rate_inr = Column(Float, default=Config.RESELLER_CREDIT_RATE_INR)   # now: minimum wallet top-up (INR)
+    usd_to_inr_rate = Column(Float, default=83.0)   # used to charge USD-wallet resellers for INR-priced products
     reseller_terms = Column(Text, default="Minimum credit pack: 10 Credits (Rs 1,500). 1 Credit = 1 Single-Use Invite Link.")
     evolution_api_url = Column(String(200), default=Config.EVOLUTION_API_URL)
     evolution_api_key = Column(String(200), default=Config.EVOLUTION_API_KEY)
@@ -368,6 +416,7 @@ class SystemSettings(Base):
             "admin_contact_number": self.admin_contact_number or "",
             "qr_code_image_url": self.qr_code_image_url,
             "reseller_credit_rate_inr": self.reseller_credit_rate_inr,
+            "usd_to_inr_rate": self.usd_to_inr_rate or 83.0,
             "reseller_terms": self.reseller_terms,
             "evolution_api_url": self.evolution_api_url,
             "evolution_api_key": self._mask(self.evolution_api_key),
@@ -757,6 +806,59 @@ def assign_legacy_credits(db, reseller: Reseller, product: Product, amount: int)
                                            note=f"Assigned {amount} legacy credit(s) to {product.name}")
 
 
+# ---------------------------------------------------------------------
+# Money wallet (current model). The per-product credit helpers above are legacy and
+# only used by the one-time migration.
+# ---------------------------------------------------------------------
+
+def product_charge_for(db, reseller: Reseller, product: Product) -> float:
+    """What this reseller pays for ONE link of `product`, in the reseller's own currency."""
+    price_inr = product.get_reseller_price()
+    if (reseller.currency or "INR").upper() == "USD":
+        rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+        return round(price_inr / rate, 2) if rate > 0 else price_inr
+    return price_inr
+
+
+def wallet_summary_text(db, reseller: Reseller) -> str:
+    return reseller.money()
+
+
+def adjust_reseller_wallet(db, reseller: Reseller, amount: float, reason: str = "admin_topup",
+                           note: str = "", product_id: Optional[int] = None, link_id: Optional[int] = None) -> Dict[str, Any]:
+    """Add (+) or deduct (-) money from a reseller's wallet with a ledger entry. Never goes negative."""
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "INVALID_AMOUNT", "message": "Amount must be a number."}
+    if amount == 0:
+        return {"success": False, "error": "INVALID_AMOUNT", "message": "Amount cannot be zero."}
+    # Atomic conditional UPDATE against the LIVE database value. Never do read-modify-write on the
+    # in-memory object: a stale copy (e.g. admin top-up while a claim ran in another request) would
+    # silently overwrite money. The WHERE clause also guarantees the balance can't go negative.
+    with _CLAIM_LOCK:
+        result = db.execute(
+            update(Reseller)
+            .where(Reseller.id == reseller.id, Reseller.wallet_balance + amount >= 0)
+            .values(wallet_balance=Reseller.wallet_balance + amount, updated_at=utcnow())
+        )
+        if result.rowcount != 1:
+            db.rollback()
+            db.refresh(reseller)
+            return {"success": False, "error": "INSUFFICIENT",
+                    "message": f"Cannot deduct {reseller.money(abs(amount))}: balance is only {reseller.money()}."}
+        db.refresh(reseller)  # re-read the row we just updated (same transaction)
+        db.add(WalletTransaction(
+            reseller_id=reseller.id, amount=amount, balance_after=round(float(reseller.wallet_balance), 2),
+            currency=(reseller.currency or "INR").upper(), reason=reason, product_id=product_id, link_id=link_id,
+            reference_note=note or (f"{'Added' if amount > 0 else 'Deducted'} {reseller.money(abs(amount))}"),
+        ))
+        db.commit()
+    db.refresh(reseller)
+    return {"success": True, "change": amount, "new_balance": round(float(reseller.wallet_balance), 2),
+            "currency": (reseller.currency or "INR").upper(), "balance_display": reseller.money()}
+
+
 def verify_reseller_auth(phone: str, secret_code: str, db=None) -> Tuple[bool, Optional[Reseller], str]:
     """
     Returns (is_valid, reseller, message). Wrong codes count towards a temporary lockout;
@@ -934,7 +1036,8 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
             "message": f"You can claim at most {Config.MAX_CLAIM_QUANTITY} links per request.",
         }
 
-    total_credits_needed = product.credit_cost * quantity
+    unit_charge = product_charge_for(db, reseller, product)     # in the reseller's currency
+    total_charge = round(unit_charge * quantity, 2)
 
     # Verify freshness lazily before claiming, so resellers only get fresh links.
     try:
@@ -945,34 +1048,34 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
 
     try:
         with _CLAIM_LOCK:
-            # 1. Guarded PER-PRODUCT credit deduction. Credits for other products don't count:
-            #    a reseller with Gemini credits cannot claim Claude links.
+            # 1. Guarded WALLET deduction: money is taken only if the balance covers the price.
             if not reseller.is_active:
                 return {"success": False, "error": "AUTH_FAILED", "message": "Reseller account is inactive."}
             result = db.execute(
-                update(ResellerCredit)
+                update(Reseller)
                 .where(
-                    ResellerCredit.reseller_id == reseller.id,
-                    ResellerCredit.product_id == product.id,
-                    ResellerCredit.credits >= total_credits_needed,
+                    Reseller.id == reseller.id,
+                    Reseller.is_active == True,  # noqa: E712
+                    Reseller.wallet_balance >= total_charge,
                 )
-                .values(credits=ResellerCredit.credits - total_credits_needed, updated_at=utcnow())
+                .values(wallet_balance=Reseller.wallet_balance - total_charge, updated_at=utcnow())
             )
             if result.rowcount != 1:
                 db.rollback()
-                have = get_reseller_credit_for_product(db, reseller.id, product.id)
-                summary = credits_summary_text(db, reseller)
+                db.refresh(reseller)
                 return {
                     "success": False,
-                    "error": "INSUFFICIENT_CREDITS",
+                    "error": "INSUFFICIENT_BALANCE",
                     "message": (
-                        f"Aapke paas {product.name} ke liye {have} credit(s) hain, "
-                        f"lekin {total_credits_needed} chahiye ({product.credit_cost} x {quantity}). "
-                        f"Aapke credits: {summary}. Is product ke credits ke liye admin se baat karein."
+                        f"Aapke wallet me {reseller.money()} hai, lekin {product.name.split(' (')[0]} "
+                        f"ki {quantity} link ka price {reseller.money(total_charge)} hai "
+                        f"({reseller.money(unit_charge)} x {quantity}). Wallet top-up ke liye admin se baat karein."
                     ),
-                    "credits_for_product": have,
-                    "credits_required": total_credits_needed,
-                    "credits_by_product": get_reseller_product_credits(db, reseller),
+                    "wallet_balance": reseller.wallet_balance,
+                    "balance_display": reseller.money(),
+                    "required": total_charge,
+                    "required_display": reseller.money(total_charge),
+                    "currency": (reseller.currency or "INR").upper(),
                 }
 
             # 2. Burn links.
@@ -984,36 +1087,42 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
                 return {
                     "success": False,
                     "error": "OUT_OF_STOCK",
-                    "message": f"Only {available} link(s) currently in stock for {product.name}. Requested {quantity}. No credits were deducted.",
+                    "message": f"Only {available} link(s) currently in stock for {product.name}. Requested {quantity}. No money was deducted.",
                     "available_stock": available,
                 }
 
-            # 3. Audit trail + keep the display total in sync.
-            remaining_for_product = get_reseller_credit_for_product(db, reseller.id, product.id)
-            sync_reseller_total(db, reseller)
+            # 3. Ledger entries (one per link).
+            db.refresh(reseller)
+            running = float(reseller.wallet_balance) + total_charge
             for link in links:
-                db.add(CreditTransaction(
+                running = round(running - unit_charge, 2)
+                db.add(WalletTransaction(
                     reseller_id=reseller.id,
-                    amount=-product.credit_cost,
-                    balance_after=remaining_for_product,
-                    reason="claim_link",
+                    amount=-unit_charge,
+                    balance_after=running,
+                    currency=(reseller.currency or "INR").upper(),
+                    reason="link_purchase",
                     product_id=product.id,
                     link_id=link.id,
-                    reference_note=f"Redeemed 1 single-use link for {product.name} ({order_ref})",
+                    reference_note=f"Bought 1 single-use link of {product.name} ({order_ref})",
                 ))
             db.commit()
             db.refresh(reseller)
 
-        logger.info("Reseller %s claimed %d x %s (%s credits left for it)", reseller.phone, quantity, product.slug, remaining_for_product)
+        logger.info("Reseller %s bought %d x %s for %s (balance now %s)", reseller.phone, quantity, product.slug,
+                    reseller.money(total_charge), reseller.money())
         return {
             "success": True,
             "message": f"Successfully claimed {quantity} link(s) for {product.name}!",
             "product_name": product.name,
             "quantity": quantity,
-            "credits_deducted": total_credits_needed,
-            "remaining_credits": remaining_for_product,          # for THIS product
-            "remaining_total_credits": reseller.credits_balance,  # across all products
-            "credits_by_product": get_reseller_product_credits(db, reseller),
+            "charged": total_charge,
+            "charged_display": reseller.money(total_charge),
+            "unit_price": unit_charge,
+            "unit_price_display": reseller.money(unit_charge),
+            "remaining_balance": reseller.wallet_balance,
+            "balance_display": reseller.money(),
+            "currency": (reseller.currency or "INR").upper(),
             "links": [l.link_or_key for l in links],
             "links_claimed_ids": [l.id for l in links],
             "reseller_name": reseller.name,
@@ -1171,22 +1280,40 @@ def _ensure_columns() -> None:
             index.create(bind=engine, checkfirst=True)
 
 
-def _migrate_legacy_credits(db) -> None:
+def _migrate_credits_to_wallet(db) -> None:
     """
-    Older databases had one generic wallet per reseller. Credits are now per product, so
-    any generic balance with no per-product rows is parked as 'legacy_unassigned_credits'
-    for the admin to assign to a product. Idempotent (balance is zeroed after the move).
+    One-time conversion of the old credit systems into money:
+      * per-product credits  -> credits x that product's reseller price (INR)
+      * unassigned/generic credits -> credits x reseller_credit_rate_inr
+    Balances land in `wallet_balance` (INR) with a 'migration' ledger entry; the old rows/
+    counters are zeroed/deleted so this is idempotent and never runs twice for a reseller.
     """
-    moved = 0
+    rate = float(get_settings(db).reseller_credit_rate_inr or 150.0)
+    migrated = 0
     for r in db.query(Reseller).all():
-        has_rows = db.query(ResellerCredit.id).filter_by(reseller_id=r.id).first() is not None
-        if not has_rows and (r.credits_balance or 0) > 0:
-            r.legacy_unassigned_credits = (r.legacy_unassigned_credits or 0) + r.credits_balance
-            r.credits_balance = 0
-            moved += 1
-    if moved:
+        rows = db.query(ResellerCredit).filter_by(reseller_id=r.id).all()
+        legacy = int(r.legacy_unassigned_credits or 0)
+        generic = int(r.credits_balance or 0) if not rows else 0   # credits_balance mirrors rows when rows exist
+        if not rows and legacy == 0 and generic == 0:
+            continue
+        value = 0.0
+        for rc in rows:
+            price = rc.product.get_reseller_price() if rc.product else rate
+            value += rc.credits * price
+            db.delete(rc)
+        value += legacy * rate + generic * rate
+        value = round(value, 2)
+        r.legacy_unassigned_credits = 0
+        r.credits_balance = 0
+        if value > 0:
+            r.wallet_balance = round(float(r.wallet_balance or 0) + value, 2)
+            db.add(WalletTransaction(reseller_id=r.id, amount=value, balance_after=r.wallet_balance,
+                                     currency=(r.currency or "INR").upper(), reason="migration",
+                                     reference_note="Converted old credits into wallet money"))
+        migrated += 1
+    if migrated:
         db.commit()
-        logger.info("Migrated generic wallet credits to 'unassigned' for %d reseller(s) - assign them to products in Admin.", moved)
+        logger.info("Converted old credits into wallet money for %d reseller(s).", migrated)
 
 
 def init_db() -> None:
@@ -1198,7 +1325,7 @@ def init_db() -> None:
         if db.query(Product).count() == 0:
             seed_data(db)
             logger.info("Seeded demo products, links and resellers.")
-        _migrate_legacy_credits(db)
+        _migrate_credits_to_wallet(db)
     finally:
         db.close()
 
@@ -1269,8 +1396,7 @@ def seed_data(db) -> None:
     db.add_all(resellers)
     db.commit()
 
-    # Credits are PER PRODUCT: Rahul can claim Gemini + Claude, Amit only ChatGPT, Pooja only Canva.
+    # Money wallets: each link costs the product's reseller price (defaults to base price).
     r1, r2, r3 = resellers
-    for reseller, product, credits in ((r1, p1, 15), (r1, p2, 10), (r2, p3, 10), (r3, p4, 3)):
-        adjust_reseller_product_credits(db, reseller, product, credits, reason="admin_topup",
-                                        note="Initial account onboarding credits")
+    for reseller, amount in ((r1, 5000.0), (r2, 2000.0), (r3, 500.0)):
+        adjust_reseller_wallet(db, reseller, amount, reason="admin_topup", note="Initial onboarding top-up")

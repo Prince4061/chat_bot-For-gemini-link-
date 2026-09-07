@@ -26,8 +26,7 @@ from database import (
     find_product,
     generate_order_id,
     verify_reseller_auth,
-    get_reseller_product_credits,
-    credits_summary_text,
+    product_charge_for,
     process_reseller_claim_for,
     fulfill_order,
     get_pending_order_for_session,
@@ -80,7 +79,8 @@ def get_live_product_catalog(user_role: str = "customer", search: str = "") -> s
     Fetch the live catalogue with real-time pricing and stock. The catalogue can be very large,
     so at most 25 products are returned: pass `search` (brand or product words, e.g. "notion team",
     "canva") to narrow it down, and use get_product_pricing for one exact product.
-    Customers see the selling price (base + admin margin %); resellers see the credit cost per link.
+    Customers see the selling price (base + admin margin %); resellers see the reseller price per link
+    (deducted from their money wallet).
     """
     from sqlalchemy import or_
     from database import stock_counts_by_product
@@ -111,7 +111,7 @@ def get_live_product_catalog(user_role: str = "customer", search: str = "") -> s
                 "category": p.category,
                 "description": p.description,
                 "customer_selling_price_inr": p.get_customer_price(),
-                "reseller_credit_cost": p.credit_cost,
+                "reseller_price_inr": p.get_reseller_price(),
                 "in_stock": stock > 0,
                 "available_stock": stock,
             })
@@ -129,7 +129,7 @@ def get_live_product_catalog(user_role: str = "customer", search: str = "") -> s
 
 @tool
 def get_product_pricing(product_name_or_slug: str, user_role: str = "customer") -> str:
-    """Fetch one product's live selling price, reseller credit cost and stock count."""
+    """Fetch one product's live customer price, reseller price (INR) and stock count."""
     db = get_db()
     try:
         product = find_product(db, product_name_or_slug)
@@ -146,7 +146,7 @@ def get_product_pricing(product_name_or_slug: str, user_role: str = "customer") 
             "category": product.category,
             "description": product.description,
             "customer_selling_price_inr": product.get_customer_price(),
-            "reseller_credit_cost": product.credit_cost,
+            "reseller_price_inr": product.get_reseller_price(),
             "available_stock": stock,
             "in_stock": stock > 0,
         })
@@ -174,7 +174,7 @@ def verify_reseller_credentials(phone: str, secret_code: str) -> str:
                 "status": "failed",
                 "authenticated": False,
                 "message": msg,
-                "suggestion": "If they are not a reseller yet, call get_reseller_onboarding_info to explain how to buy credits.",
+                "suggestion": "If they are not a reseller yet, call get_reseller_onboarding_info to explain how to become one and add money.",
             })
         _remember_reseller(db, reseller)
         record_tool_call("verify_reseller_credentials", True, reseller.phone)
@@ -184,21 +184,21 @@ def verify_reseller_credentials(phone: str, secret_code: str) -> str:
             "reseller_id": reseller.id,
             "reseller_name": reseller.name,
             "phone": reseller.phone,
-            "credits_balance": reseller.credits_balance,
-            "credits_by_product": get_reseller_product_credits(db, reseller),
-            "credits_summary": credits_summary_text(db, reseller),
-            "note": "Credits are PER PRODUCT - the reseller can only claim products they have credits for.",
-            "message": f"Welcome back {reseller.name}! Credits: {credits_summary_text(db, reseller)}. Verified for this session.",
+            "wallet_balance": reseller.wallet_balance,
+            "currency": (reseller.currency or "INR").upper(),
+            "balance_display": reseller.money(),
+            "note": "The reseller has a MONEY wallet; each link deducts the product's reseller price.",
+            "message": f"Welcome back {reseller.name}! Wallet balance: {reseller.money()}. Verified for this session.",
         })
     finally:
         db.close()
 
 
 @tool
-def check_reseller_credits(phone: str = "", secret_code: str = "") -> str:
+def check_reseller_balance(phone: str = "", secret_code: str = "") -> str:
     """
-    Check a reseller's wallet balance. If the reseller is already verified in this
-    conversation you may call this with no arguments.
+    Check a reseller's money wallet balance (INR/USD) and what each product costs them.
+    If the reseller is already verified in this conversation you may call this with no arguments.
     """
     db = get_db()
     try:
@@ -206,24 +206,28 @@ def check_reseller_credits(phone: str = "", secret_code: str = "") -> str:
         if phone and secret_code:
             is_auth, reseller, msg = verify_reseller_auth(phone, secret_code, db=db)
             if not is_auth:
-                record_tool_call("check_reseller_credits", False, msg)
+                record_tool_call("check_reseller_balance", False, msg)
                 return _json({"status": "failed", "message": msg})
             _remember_reseller(db, reseller)
         else:
             reseller = _session_reseller(db)
             if not reseller:
-                record_tool_call("check_reseller_credits", False, "not verified")
+                record_tool_call("check_reseller_balance", False, "not verified")
                 return _json({"status": "auth_required", "message": "Ask the reseller for their registered phone number and 4-digit passcode first."})
 
-        record_tool_call("check_reseller_credits", True, reseller.phone)
+        record_tool_call("check_reseller_balance", True, reseller.phone)
         return _json({
             "status": "success",
             "reseller_name": reseller.name,
             "phone": reseller.phone,
-            "credits_balance": reseller.credits_balance,
-            "credits_by_product": get_reseller_product_credits(db, reseller),
-            "credits_summary": credits_summary_text(db, reseller),
-            "rate_info": "1 Credit = 1 single-use link of THAT product only (credits are per product)",
+            "wallet_balance": reseller.wallet_balance,
+            "currency": (reseller.currency or "INR").upper(),
+            "balance_display": reseller.money(),
+            "product_prices_for_you": [
+                {"product": p.name, "price": product_charge_for(db, reseller, p), "price_display": reseller.money(product_charge_for(db, reseller, p))}
+                for p in db.query(Product).filter(Product.is_active == True).order_by(Product.id).limit(25).all()  # noqa: E712
+            ],
+            "rate_info": "Each link deducts that product's reseller price from the wallet.",
         })
     finally:
         db.close()
@@ -233,8 +237,8 @@ def check_reseller_credits(phone: str = "", secret_code: str = "") -> str:
 def claim_reseller_product_link(product_name: str, quantity: int = 1, phone: str = "", secret_code: str = "") -> str:
     """
     Dispense single-use invite link(s) to a reseller: verifies credentials (or reuses the
-    verification from earlier in this conversation), checks credits and stock, atomically
-    burns the link(s) from inventory and deducts credits.
+    verification from earlier in this conversation), checks wallet balance and stock, atomically
+    burns the link(s) from inventory and deducts the product's reseller price from the wallet.
     Pass phone + secret_code only if the reseller is not yet verified in this session.
     """
     db = get_db()
@@ -457,28 +461,29 @@ def get_order_status(order_id: str = "") -> str:
 
 @tool
 def get_reseller_onboarding_info() -> str:
-    """Reseller onboarding terms, credit pack prices and how to pay the admin to buy credits."""
+    """Reseller onboarding: how to become a reseller, add money to the wallet, and per-link reseller prices."""
     db = get_db()
     try:
         s = get_settings(db)
-        rate = s.reseller_credit_rate_inr
+        min_topup = float(s.reseller_credit_rate_inr or 0)
         contact = (s.admin_contact_number or "").strip()
         record_tool_call("get_reseller_onboarding_info", True)
         join = (
-            f"1. Contact the admin{(' on ' + contact) if contact else ''} to buy a credit pack. "
-            f"2. Pay via UPI to {s.admin_upi_id} and share the screenshot. "
-            "3. Admin registers your number as a reseller. "
-            "4. After that, just message from this same number and your credits/links work automatically."
+            f"1. Contact the admin{(' on ' + contact) if contact else ''}. "
+            f"2. Pay the amount you want in your wallet via UPI to {s.admin_upi_id} and share the screenshot. "
+            "3. Admin registers your number as a reseller and adds the money to your wallet. "
+            "4. After that, just message from this same number: every link's reseller price is deducted from the wallet automatically."
         )
+        prices = [
+            {"product": p.name, "reseller_price_inr": p.get_reseller_price()}
+            for p in db.query(Product).filter(Product.is_active == True).order_by(Product.id).limit(25).all()  # noqa: E712
+        ]
         return _json({
             "status": "success",
             "business_name": s.business_name,
-            "credit_rate_per_unit_inr": rate,
-            "credit_packages": [
-                {"pack": "Starter Pack", "credits": 10, "price_inr": round(rate * 10)},
-                {"pack": "Growth Pack", "credits": 50, "price_inr": round(rate * 50 * 0.9), "note": "10% discount"},
-                {"pack": "VIP Wholesaler", "credits": 100, "price_inr": round(rate * 100 * 0.8), "note": "20% discount"},
-            ],
+            "wallet_model": "Money wallet (INR/USD). Each link deducts that product's reseller price.",
+            "minimum_topup_inr": min_topup,
+            "reseller_prices": prices,
             "admin_upi_id": s.admin_upi_id,
             "admin_upi_name": s.admin_upi_name,
             "admin_contact_number": contact,
@@ -505,7 +510,7 @@ ALL_AGENT_TOOLS = [
     get_live_product_catalog,
     get_product_pricing,
     verify_reseller_credentials,
-    check_reseller_credits,
+    check_reseller_balance,
     claim_reseller_product_link,
     logout_reseller_session,
     create_customer_order,

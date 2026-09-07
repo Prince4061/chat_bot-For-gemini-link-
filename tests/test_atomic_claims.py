@@ -33,49 +33,64 @@ def test_concurrent_claims_never_hand_out_the_same_link(db, fresh_product):
     assert fresh_product.get_available_stock_count(db) == 0
 
 
-def test_reseller_claim_deducts_credits_and_logs(db, fresh_product, fresh_reseller):
+def test_reseller_claim_deducts_money_and_logs(db, fresh_product, fresh_reseller):
     res = dbm.process_reseller_claim_for(fresh_reseller, fresh_product, 2, db)
     assert res["success"], res
     assert len(res["links"]) == 2
-    assert res["remaining_credits"] == 3
+    assert res["charged"] == 200.0 and res["remaining_balance"] == 300.0     # ₹100/link, ₹500 wallet
+    assert res["balance_display"] == "₹300.00"
     db.refresh(fresh_reseller)
-    assert fresh_reseller.credits_balance == 3
-    txns = db.query(dbm.CreditTransaction).filter(
-        dbm.CreditTransaction.reseller_id == fresh_reseller.id, dbm.CreditTransaction.reason == "claim_link").all()
-    assert len(txns) == 2 and all(t.amount == -1 and t.product_id == fresh_product.id for t in txns)
+    assert fresh_reseller.wallet_balance == 300.0
+    txns = db.query(dbm.WalletTransaction).filter(
+        dbm.WalletTransaction.reseller_id == fresh_reseller.id, dbm.WalletTransaction.reason == "link_purchase").all()
+    assert len(txns) == 2 and all(t.amount == -100.0 and t.product_id == fresh_product.id for t in txns)
+    assert sorted(t.balance_after for t in txns) == [300.0, 400.0]
 
 
-def test_out_of_stock_rolls_back_credit_deduction(db, fresh_product, fresh_reseller):
+def test_out_of_stock_rolls_back_money_deduction(db, fresh_product, fresh_reseller):
     res = dbm.process_reseller_claim_for(fresh_reseller, fresh_product, 4, db)  # only 3 in stock
     assert not res["success"] and res["error"] == "OUT_OF_STOCK"
     db.refresh(fresh_reseller)
-    assert fresh_reseller.credits_balance == 5, "credits must not be lost when stock runs out"
+    assert fresh_reseller.wallet_balance == 500.0, "money must not be lost when stock runs out"
     assert fresh_product.get_available_stock_count(db) == 3
 
 
-def test_insufficient_credits_blocks_claim(db, fresh_product, fresh_reseller):
-    dbm.adjust_reseller_product_credits(db, fresh_reseller, fresh_product, -4)  # 5 -> 1
-    res = dbm.process_reseller_claim_for(fresh_reseller, fresh_product, 2, db)
-    assert not res["success"] and res["error"] == "INSUFFICIENT_CREDITS"
+def test_insufficient_balance_blocks_claim(db, fresh_product, fresh_reseller):
+    dbm.adjust_reseller_wallet(db, fresh_reseller, -400)  # ₹500 -> ₹100
+    res = dbm.process_reseller_claim_for(fresh_reseller, fresh_product, 2, db)  # needs ₹200
+    assert not res["success"] and res["error"] == "INSUFFICIENT_BALANCE"
+    assert "₹100.00" in res["message"] and "₹200.00" in res["message"]
     assert fresh_product.get_available_stock_count(db) == 3
-
-
-def test_credits_are_product_specific(db, fresh_product, fresh_reseller):
-    """Credits for product A must NOT let the reseller claim product B."""
-    import uuid
-    other = dbm.Product(name=f"Other {uuid.uuid4().hex[:6]}", slug=f"other-{uuid.uuid4().hex[:6]}", base_price=50, margin_percent=0)
-    db.add(other); db.commit()
-    db.add(dbm.InviteLink(product_id=other.id, link_or_key="https://example.com/other/1")); db.commit()
-
-    res = dbm.process_reseller_claim_for(fresh_reseller, other, 1, db)   # has 5 credits, but for fresh_product
-    assert not res["success"] and res["error"] == "INSUFFICIENT_CREDITS"
-    assert res["credits_for_product"] == 0
-    assert other.get_available_stock_count(db) == 1                       # nothing burned
     db.refresh(fresh_reseller)
-    assert fresh_reseller.credits_balance == 5                            # nothing deducted
+    assert fresh_reseller.wallet_balance == 100.0
 
-    ok = dbm.process_reseller_claim_for(fresh_reseller, fresh_product, 1, db)  # the product it DOES have credits for
-    assert ok["success"] and ok["remaining_credits"] == 4
+
+def test_wallet_covers_any_product_by_price(db, fresh_product, fresh_reseller):
+    """Money is not tied to a product: a pricier product is refused only if the wallet can't cover it."""
+    import uuid
+    pricey = dbm.Product(name=f"Pricey {uuid.uuid4().hex[:6]}", slug=f"pricey-{uuid.uuid4().hex[:6]}", base_price=50, margin_percent=0, reseller_price=900.0)
+    cheap = dbm.Product(name=f"Cheap {uuid.uuid4().hex[:6]}", slug=f"cheap-{uuid.uuid4().hex[:6]}", base_price=50, margin_percent=0)  # reseller price = base ₹50
+    db.add_all([pricey, cheap]); db.commit()
+    db.add_all([dbm.InviteLink(product_id=pricey.id, link_or_key="https://example.com/pricey/1"),
+                dbm.InviteLink(product_id=cheap.id, link_or_key="https://example.com/cheap/1")]); db.commit()
+
+    res = dbm.process_reseller_claim_for(fresh_reseller, pricey, 1, db)     # ₹900 > ₹500 wallet
+    assert not res["success"] and res["error"] == "INSUFFICIENT_BALANCE"
+    assert pricey.get_available_stock_count(db) == 1
+    ok = dbm.process_reseller_claim_for(fresh_reseller, cheap, 1, db)       # ₹50 <= ₹500
+    assert ok["success"] and ok["charged"] == 50.0 and ok["remaining_balance"] == 450.0
+
+
+def test_usd_wallet_is_charged_at_configured_rate(db, fresh_product):
+    s = dbm.get_settings(db); s.usd_to_inr_rate = 80.0; db.commit()
+    import uuid
+    usd = dbm.Reseller(name="Dollar Dan", phone="8" + str(uuid.uuid4().int)[:9], secret_code="1111", currency="USD")
+    db.add(usd); db.commit(); db.refresh(usd)
+    dbm.adjust_reseller_wallet(db, usd, 10.0)                               # $10
+    assert dbm.product_charge_for(db, usd, fresh_product) == 1.25          # ₹100 / 80
+    res = dbm.process_reseller_claim_for(usd, fresh_product, 2, db)
+    assert res["success"] and res["charged"] == 2.5 and res["balance_display"] == "$7.50"
+    assert res["currency"] == "USD"
 
 
 def test_quantity_bounds(db, fresh_product, fresh_reseller):

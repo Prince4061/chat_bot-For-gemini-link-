@@ -66,19 +66,22 @@ def test_correct_code_resets_failed_attempts(db, fresh_reseller):
 def test_reseller_validation(client, admin_headers, fresh_product):
     assert client.post("/api/admin/resellers", json={"phone": "123", "secret_code": "1234"}, headers=admin_headers).status_code == 400
     assert client.post("/api/admin/resellers", json={"phone": "9000000001", "secret_code": "12"}, headers=admin_headers).status_code == 400
-    # Initial credits need a product (credits are per product)
-    assert client.post("/api/admin/resellers", json={"name": "A", "phone": "9000000001", "secret_code": "1234", "credits_balance": 2}, headers=admin_headers).status_code == 400
-    r = client.post("/api/admin/resellers", json={"name": "A", "phone": "9000000001", "secret_code": "1234", "credits_balance": 2, "product_id": fresh_product.id}, headers=admin_headers)
+    # Money wallet with currency
+    assert client.post("/api/admin/resellers", json={"name": "A", "phone": "9000000001", "secret_code": "1234", "currency": "EUR"}, headers=admin_headers).status_code == 400
+    r = client.post("/api/admin/resellers", json={"name": "A", "phone": "9000000001", "secret_code": "1234", "wallet_balance": 250.5, "currency": "INR"}, headers=admin_headers)
     assert r.status_code == 201
     body = r.get_json()
-    assert body["credits_balance"] == 2 and body["product_credits"][0]["product_id"] == fresh_product.id
+    assert body["wallet_balance"] == 250.5 and body["currency"] == "INR" and body["wallet_display"] == "₹250.50"
     assert client.post("/api/admin/resellers", json={"name": "B", "phone": "9000000001", "secret_code": "1234"}, headers=admin_headers).status_code == 409
     rid = body["id"]
-    # product_id required; deducting more than held is rejected
-    assert client.post(f"/api/admin/resellers/{rid}/credits", json={"amount": -5}, headers=admin_headers).status_code == 400
-    assert client.post(f"/api/admin/resellers/{rid}/credits", json={"amount": -5, "product_id": fresh_product.id}, headers=admin_headers).status_code == 400
-    ok = client.post(f"/api/admin/resellers/{rid}/credits", json={"amount": 3, "product_id": fresh_product.id}, headers=admin_headers).get_json()
-    assert ok["credits_for_product"] == 5 and ok["new_balance"] == 5
+    # deducting more than the balance is rejected; top-up works; ledger records it
+    assert client.post(f"/api/admin/resellers/{rid}/wallet", json={"amount": -999}, headers=admin_headers).status_code == 400
+    ok = client.post(f"/api/admin/resellers/{rid}/wallet", json={"amount": 749.5, "note": "UPI UTR 1"}, headers=admin_headers).get_json()
+    assert ok["new_balance"] == 1000.0 and ok["balance_display"] == "₹1,000.00"
+    ledger = client.get(f"/api/admin/resellers/{rid}/transactions", headers=admin_headers).get_json()
+    assert [t["amount"] for t in ledger] == [749.5, 250.5] and ledger[0]["reference_note"] == "UPI UTR 1"
+    # currency can be switched by the admin
+    assert client.put(f"/api/admin/resellers/{rid}", json={"currency": "USD"}, headers=admin_headers).get_json()["currency"] == "USD"
 
 
 def test_bulk_upload_skips_duplicates(client, admin_headers, fresh_product):

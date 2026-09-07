@@ -27,8 +27,23 @@ export default function ProductManager() {
     description: '',
     base_price: 300,
     margin_percent: 35,
-    credit_cost: 1
+    reseller_price: ''
   });
+  const [resellerPriceDraft, setResellerPriceDraft] = useState({});
+
+  const saveResellerPrice = async (p) => {
+    const raw = resellerPriceDraft[p.id];
+    if (raw === undefined) return;
+    try {
+      await adminApi.updateProduct(p.id, { reseller_price: raw === '' ? null : parseFloat(raw) });
+      setSuccessMsg(`Reseller price updated for ${p.name}.`);
+      setTimeout(() => setSuccessMsg(''), 3000);
+      setResellerPriceDraft((d) => { const n = { ...d }; delete n[p.id]; return n; });
+      loadProducts();
+    } catch (err) {
+      alert('Failed to update reseller price: ' + err.message);
+    }
+  };
 
   const loadProducts = async () => {
     try {
@@ -85,7 +100,7 @@ export default function ProductManager() {
         description: '',
         base_price: 300,
         margin_percent: 35,
-        credit_cost: 1
+        reseller_price: ''
       });
       loadProducts();
     } catch (err) {
@@ -225,9 +240,22 @@ export default function ProductManager() {
                   </div>
                 </div>
 
-                <div className="flex justify-between items-center text-[11px] text-[#8e8ea0] mb-3 px-1">
-                  <span>Reseller Credit Cost:</span>
-                  <span className="font-mono text-[#ececec] font-bold">{p.credit_cost} Credit</span>
+                <div className="flex justify-between items-center text-[11px] text-[#8e8ea0] mb-3 px-1 gap-2">
+                  <span title="Reseller ke wallet se itna katta hai per link">Reseller Price (₹/link):</span>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number" step="0.01" min="0"
+                      value={resellerPriceDraft[p.id] ?? (p.reseller_price_set ? p.reseller_price : '')}
+                      placeholder={`= base ₹${p.base_price.toFixed(0)}`}
+                      onChange={(e) => setResellerPriceDraft((d) => ({ ...d, [p.id]: e.target.value }))}
+                      onBlur={() => saveResellerPrice(p)}
+                      onKeyDown={(e) => e.key === 'Enter' && e.target.blur()}
+                      className="w-24 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] font-mono font-bold focus:outline-none focus:border-white/25"
+                    />
+                    {!p.reseller_price_set && resellerPriceDraft[p.id] === undefined && (
+                      <span className="text-[10px] text-[#8e8ea0]">(= base)</span>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -283,13 +311,14 @@ export default function ProductManager() {
                 </div>
 
                 <div>
-                  <label className="block text-[#8e8ea0] mb-1 font-medium">Reseller Credit Cost</label>
+                  <label className="block text-[#8e8ea0] mb-1 font-medium">Reseller Price (₹/link)</label>
                   <input
                     type="number"
-                    min="1"
-                    value={formData.credit_cost}
-                    onChange={(e) => setFormData({ ...formData, credit_cost: parseInt(e.target.value) || 1 })}
-                    required
+                    min="0"
+                    step="0.01"
+                    placeholder="blank = base price"
+                    value={formData.reseller_price}
+                    onChange={(e) => setFormData({ ...formData, reseller_price: e.target.value })}
                     className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] focus:outline-none focus:border-white/15"
                   />
                 </div>

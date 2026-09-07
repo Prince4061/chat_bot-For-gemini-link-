@@ -126,7 +126,7 @@ export default function EvolutionSimulator() {
                   type="button"
                   onClick={() => {
                     setPhone('9000000000');
-                    setMessage('mujhe reseller credits chahiye');
+                    setMessage('mujhe reseller banna hai, wallet me paise kaise daalu?');
                   }}
                   className="px-2 py-1 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/10 rounded-lg text-[11px] text-amber-300"
                 >

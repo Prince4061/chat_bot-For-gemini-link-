@@ -44,12 +44,11 @@ from database import (  # noqa: E402  (config must load first)
     ChatSessionRecord,
     ChatMessageRecord,
     KnowledgeEntry,
-    ResellerCredit,
+    WalletTransaction,
     fulfill_order,
     normalize_phone,
     is_valid_secret_code,
-    adjust_reseller_product_credits,
-    assign_legacy_credits,
+    adjust_reseller_wallet,
     stock_counts_by_product,
 )
 from agent_core import run_deep_agent_chat, agent_status, test_llm_connection, invalidate_agent_cache  # noqa: E402
@@ -469,7 +468,11 @@ def get_admin_metrics():
         claimed = db.query(func.count(InviteLink.id)).filter(InviteLink.status == "claimed").scalar() or 0
         total_products = db.query(func.count(Product.id)).scalar() or 0
         total_resellers = db.query(func.count(Reseller.id)).scalar() or 0
-        total_credits = db.query(func.coalesce(func.sum(Reseller.credits_balance), 0)).scalar() or 0
+        # Wallet money across resellers, normalised to INR for the dashboard card.
+        usd_rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+        total_wallet_inr = 0.0
+        for bal, cur in db.query(Reseller.wallet_balance, Reseller.currency).all():
+            total_wallet_inr += float(bal or 0) * (usd_rate if (cur or "INR").upper() == "USD" else 1.0)
         revenue = db.query(func.coalesce(func.sum(CustomerOrder.total_amount), 0.0)).filter(CustomerOrder.status.in_(["delivered", "fulfillment_pending"])).scalar() or 0.0
         pending_orders = db.query(func.count(CustomerOrder.id)).filter(CustomerOrder.status == "pending_payment").scalar() or 0
         needs_fulfilment = db.query(func.count(CustomerOrder.id)).filter(CustomerOrder.status == "fulfillment_pending").scalar() or 0
@@ -486,7 +489,7 @@ def get_admin_metrics():
             "available_links": available,
             "claimed_links": claimed,
             "total_resellers": total_resellers,
-            "total_credits_in_wallets": int(total_credits),
+            "total_wallet_balance_inr": round(total_wallet_inr, 2),
             "total_customer_revenue": float(revenue),
             "pending_orders": pending_orders,
             "orders_needing_fulfilment": needs_fulfilment,
@@ -515,13 +518,25 @@ def _validate_product_payload(data: dict, partial: bool = False):
                     errors.append(f"{field} must be between {lo} and {hi}")
             except (TypeError, ValueError):
                 errors.append(f"{field} must be a number")
-    if "credit_cost" in data or not partial:
+    if "credit_cost" in data:
         try:
             if int(data.get("credit_cost", 1)) < 1:
                 errors.append("credit_cost must be >= 1")
         except (TypeError, ValueError):
             errors.append("credit_cost must be an integer")
+    if data.get("reseller_price") not in (None, ""):
+        try:
+            if not (0 <= float(data["reseller_price"]) <= 10_000_000):
+                errors.append("reseller_price must be between 0 and 10000000")
+        except (TypeError, ValueError):
+            errors.append("reseller_price must be a number")
     return errors
+
+
+def _reseller_price_from(data: dict):
+    """None/'' -> NULL (use base price); otherwise the given INR price."""
+    v = data.get("reseller_price")
+    return None if v in (None, "") else float(v)
 
 
 def _slugify(text_value: str) -> str:
@@ -576,7 +591,8 @@ def create_admin_product():
             description=str(data.get("description", ""))[:2000],
             base_price=float(data.get("base_price", 0.0)),
             margin_percent=float(data.get("margin_percent", 30.0)),
-            credit_cost=int(data.get("credit_cost", 1)),
+            credit_cost=int(data.get("credit_cost", 1) or 1),
+            reseller_price=_reseller_price_from(data),
             is_active=bool(data.get("is_active", True)),
         )
         db.add(product)
@@ -603,7 +619,8 @@ def update_admin_product(prod_id):
         if "description" in data: product.description = str(data["description"])[:2000]
         if "base_price" in data: product.base_price = float(data["base_price"])
         if "margin_percent" in data: product.margin_percent = float(data["margin_percent"])
-        if "credit_cost" in data: product.credit_cost = int(data["credit_cost"])
+        if "credit_cost" in data: product.credit_cost = int(data["credit_cost"] or 1)
+        if "reseller_price" in data: product.reseller_price = _reseller_price_from(data)
         if "is_active" in data: product.is_active = bool(data["is_active"])
         db.commit()
         return jsonify(product.to_dict(db))
@@ -839,37 +856,35 @@ def create_admin_reseller():
         return jsonify({"error": "Phone must be a valid 10-digit number"}), 400
     if not is_valid_secret_code(secret_code):
         return jsonify({"error": "secret_code must be exactly 4 digits"}), 400
-    try:
-        credits = int(data.get("credits_balance", 0))
-    except (TypeError, ValueError):
-        return jsonify({"error": "credits_balance must be an integer"}), 400
-    if credits < 0 or credits > 1_000_000:
-        return jsonify({"error": "credits_balance out of range"}), 400
 
     db = get_db()
     try:
         if db.query(Reseller).filter(Reseller.phone == phone).first():
             return jsonify({"error": "A reseller with this phone number already exists"}), 409
-        # Initial credits must be tied to a product (credits are per product now).
-        product = None
-        if credits > 0:
-            pid = data.get("product_id")
-            product = db.query(Product).filter(Product.id == int(pid)).first() if pid and str(pid).isdigit() else None
-            if not product:
-                return jsonify({"error": "product_id is required when giving initial credits (credits are per product)"}), 400
+        currency = str(data.get("currency") or "INR").upper()
+        if currency not in ("INR", "USD"):
+            return jsonify({"error": "currency must be INR or USD"}), 400
+        try:
+            initial = round(float(data.get("wallet_balance", 0) or 0), 2)
+        except (TypeError, ValueError):
+            return jsonify({"error": "wallet_balance must be a number"}), 400
+        if initial < 0 or initial > 100_000_000:
+            return jsonify({"error": "wallet_balance out of range"}), 400
 
         reseller = Reseller(
             name=str(data.get("name") or "New Reseller").strip()[:100],
             phone=phone,
             secret_code=secret_code,
             credits_balance=0,
+            wallet_balance=0.0,
+            currency=currency,
             is_active=bool(data.get("is_active", True)),
             notes=str(data.get("notes", ""))[:2000],
         )
         db.add(reseller)
         db.commit()
-        if credits > 0 and product:
-            adjust_reseller_product_credits(db, reseller, product, credits, reason="admin_topup", note="Initial onboarding credits")
+        if initial > 0:
+            adjust_reseller_wallet(db, reseller, initial, reason="admin_topup", note="Initial onboarding top-up")
         db.refresh(reseller)
         return jsonify(reseller.to_dict()), 201
     finally:
@@ -903,6 +918,11 @@ def update_admin_reseller(res_id):
             reseller.locked_until = None
         if "is_active" in data: reseller.is_active = bool(data["is_active"])
         if "notes" in data: reseller.notes = str(data["notes"])[:2000]
+        if "currency" in data:
+            cur = str(data["currency"] or "INR").upper()
+            if cur not in ("INR", "USD"):
+                return jsonify({"error": "currency must be INR or USD"}), 400
+            reseller.currency = cur
         db.commit()
         return jsonify(reseller.to_dict())
     finally:
@@ -925,65 +945,33 @@ def unlock_reseller(res_id):
         db.close()
 
 
-@app.route("/api/admin/resellers/<int:res_id>/credits", methods=["POST"])
+@app.route("/api/admin/resellers/<int:res_id>/wallet", methods=["POST"])
+@app.route("/api/admin/resellers/<int:res_id>/credits", methods=["POST"])   # legacy alias
 @require_admin
 def adjust_reseller_credits(res_id):
+    """Top up (+) or deduct (-) money from a reseller's wallet (in the reseller's currency)."""
     data = _payload()
     try:
-        amount = int(data.get("amount", 0))
+        amount = round(float(data.get("amount", 0)), 2)
     except (TypeError, ValueError):
-        return jsonify({"error": "amount must be an integer"}), 400
-    if amount == 0 or abs(amount) > 100_000:
-        return jsonify({"error": "amount must be non-zero and within ±100000"}), 400
+        return jsonify({"error": "amount must be a number"}), 400
+    if amount == 0 or abs(amount) > 10_000_000:
+        return jsonify({"error": "amount must be non-zero and within ±10000000"}), 400
     reason = str(data.get("reason") or ("admin_topup" if amount > 0 else "admin_deduct"))[:50]
-    note = str(data.get("note") or "Manual admin credit adjustment")[:500]
-    pid = data.get("product_id")
-    if not pid or not str(pid).isdigit():
-        return jsonify({"error": "product_id is required — credits are given per product"}), 400
+    note = str(data.get("note") or "Manual admin wallet adjustment")[:500]
 
     db = get_db()
     try:
         reseller = db.query(Reseller).filter(Reseller.id == res_id).first()
         if not reseller:
             return jsonify({"error": "Reseller not found"}), 404
-        product = db.query(Product).filter(Product.id == int(pid)).first()
-        if not product:
-            return jsonify({"error": "Product not found"}), 404
-        result = adjust_reseller_product_credits(db, reseller, product, amount, reason=reason, note=note)
+        result = adjust_reseller_wallet(db, reseller, amount, reason=reason, note=note)
         if not result.get("success"):
             return jsonify({"error": result.get("message")}), 400
-        logger.info("Admin adjusted %s credits for %s by %+d (now %d for it, %d total)",
-                    product.slug, reseller.phone, amount, result["credits_for_product"], result["total_credits"])
+        logger.info("Admin adjusted wallet for %s by %+.2f %s (now %s)", reseller.phone, amount, reseller.currency, reseller.money())
         return jsonify({"success": True, "reseller_id": reseller.id, "reseller_name": reseller.name,
-                        "product_id": product.id, "product_name": product.name, "change": amount,
-                        "credits_for_product": result["credits_for_product"], "new_balance": result["total_credits"],
-                        "reseller": reseller.to_dict()})
-    finally:
-        db.close()
-
-
-@app.route("/api/admin/resellers/<int:res_id>/assign-legacy", methods=["POST"])
-@require_admin
-def assign_legacy_reseller_credits(res_id):
-    """Move old generic wallet credits onto a product so they become claimable."""
-    data = _payload()
-    pid = data.get("product_id")
-    try:
-        amount = int(data.get("amount", 0))
-    except (TypeError, ValueError):
-        return jsonify({"error": "amount must be an integer"}), 400
-    if not pid or not str(pid).isdigit():
-        return jsonify({"error": "product_id is required"}), 400
-    db = get_db()
-    try:
-        reseller = db.query(Reseller).filter(Reseller.id == res_id).first()
-        product = db.query(Product).filter(Product.id == int(pid)).first()
-        if not reseller or not product:
-            return jsonify({"error": "Reseller or product not found"}), 404
-        result = assign_legacy_credits(db, reseller, product, amount)
-        if not result.get("success"):
-            return jsonify({"error": result.get("message")}), 400
-        return jsonify({"success": True, "reseller": reseller.to_dict()})
+                        "change": amount, "new_balance": result["new_balance"], "currency": result["currency"],
+                        "balance_display": result["balance_display"], "reseller": reseller.to_dict()})
     finally:
         db.close()
 
@@ -993,7 +981,7 @@ def assign_legacy_reseller_credits(res_id):
 def get_reseller_transactions(res_id):
     db = get_db()
     try:
-        txns = db.query(CreditTransaction).filter(CreditTransaction.reseller_id == res_id).order_by(CreditTransaction.id.desc()).limit(500).all()
+        txns = db.query(WalletTransaction).filter(WalletTransaction.reseller_id == res_id).order_by(WalletTransaction.id.desc()).limit(500).all()
         return jsonify([t.to_dict() for t in txns])
     finally:
         db.close()
@@ -1088,6 +1076,14 @@ def update_system_settings_api():
             except (TypeError, ValueError):
                 return jsonify({"error": "reseller_credit_rate_inr must be a number"}), 400
         if "reseller_terms" in data: s.reseller_terms = str(data["reseller_terms"])[:4000]
+        if "usd_to_inr_rate" in data:
+            try:
+                rate = float(data["usd_to_inr_rate"])
+                if rate <= 0:
+                    raise ValueError
+                s.usd_to_inr_rate = rate
+            except (TypeError, ValueError):
+                return jsonify({"error": "usd_to_inr_rate must be a positive number"}), 400
         if "evolution_api_url" in data: s.evolution_api_url = str(data["evolution_api_url"]).strip()[:200]
         if "evolution_instance_name" in data: s.evolution_instance_name = str(data["evolution_instance_name"]).strip()[:100]
         # Secrets: ignore masked echoes; empty string clears; anything else replaces.
@@ -1122,7 +1118,7 @@ def admin_bot_test():
     engine used, tools called, matched FAQ, elapsed time, and the session state.
     mode="web" (customer/reseller via chat) or "whatsapp" (identity = phone number).
     """
-    from database import match_knowledge, credits_summary_text, get_pending_order_for_session
+    from database import match_knowledge, get_pending_order_for_session
     data = _payload()
     message = str(data.get("message", "")).strip()
     if not message:
@@ -1159,7 +1155,7 @@ def admin_bot_test():
                 "platform": rec.platform,
                 "user_type": rec.user_type,
                 "customer_phone": rec.customer_phone,
-                "reseller": {"name": reseller.name, "phone": reseller.phone, "credits": credits_summary_text(db, reseller)} if reseller else None,
+                "reseller": {"name": reseller.name, "phone": reseller.phone, "balance": reseller.money(), "currency": (reseller.currency or "INR").upper()} if reseller else None,
                 "pending_order": {"id": pending.id, "product": pending.product.name if pending.product else None, "amount": pending.total_amount} if pending else None,
                 "last_order_id": rec.last_order_id,
             }

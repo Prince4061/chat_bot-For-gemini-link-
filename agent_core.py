@@ -41,8 +41,7 @@ from database import (
     find_reseller_by_phone,
     get_active_knowledge,
     match_knowledge,
-    credits_summary_text,
-    get_reseller_product_credits,
+    product_charge_for,
     stock_counts_by_product,
     process_reseller_claim_for,
     fulfill_order,
@@ -275,18 +274,19 @@ def build_session_context_text(db, session_rec: ChatSessionRecord) -> str:
         reseller = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
     if reseller and reseller.is_active and not reseller.is_locked():
         how = "auto-verified by their WhatsApp number" if is_whatsapp else "verified in this conversation"
-        summary = credits_summary_text(db, reseller)
+        summary = reseller.money()
         lines.append(
             f"- RESELLER VERIFIED ({how}): {reseller.name} (phone {reseller.phone}). "
-            f"Credits are PER PRODUCT — they currently have: {summary}. They can ONLY claim products "
-            "they hold credits for (Gemini credits cannot claim Claude, etc.). Do NOT ask for phone or "
-            "passcode; call claim_reseller_product_link(product_name, quantity) or check_reseller_credits() directly."
+            f"They have a MONEY wallet with balance {summary} ({(reseller.currency or 'INR').upper()}). "
+            "Each link deducts that product's reseller price from the wallet; they can buy any product "
+            "whose price fits the balance. Do NOT ask for phone or passcode; call "
+            "claim_reseller_product_link(product_name, quantity) or check_reseller_balance() directly."
         )
         if is_whatsapp:
             lines.append(
-                "- On WhatsApp, when this reseller greets or sends a general message, reply IMMEDIATELY with "
-                f"their name and their per-product credits (\"{summary}\") and ask which product's link "
-                "they want — do NOT wait for them to ask for their balance."
+                "- On WhatsApp, when this reseller greets or sends a general message, reply IMMEDIATELY like "
+                f"'Hello <first name> sir! Aapke paas {summary} balance hai. Kya aapko koi link chahiye?' "
+                "— do NOT wait for them to ask for their balance."
             )
     elif is_whatsapp:
         # On WhatsApp the sender's number is known and is NOT a registered reseller.
@@ -531,20 +531,20 @@ def _fmt_links(links: List[str]) -> str:
     return "\n".join(f"`{l}`" for l in links)
 
 
-def _credits_lines(res_by_product: List[Dict[str, Any]]) -> str:
-    items = [f"• {c['product_name'].split(' (')[0]}: **{c['credits']}**" for c in res_by_product if c.get("credits", 0) > 0]
-    return "\n".join(items) if items else "• koi credits nahi"
+def _reseller_prices_lines(db, reseller: Reseller, limit: int = 8) -> str:
+    """'• Gemini Advanced — ₹450' lines in the reseller's currency (what a link costs them)."""
+    prods = db.query(Product).filter(Product.is_active == True).order_by(Product.id).limit(limit).all()  # noqa: E712
+    return "\n".join(f"• {p.name.split(' (')[0]} — {reseller.money(product_charge_for(db, reseller, p))}" for p in prods)
 
 
 def _reseller_claim_reply(res: Dict[str, Any]) -> str:
     if not res.get("success"):
         return f"❌ **Reseller operation failed:** {res.get('message')}"
-    short = res['product_name'].split(' (')[0]
     return (
         "🎉 **Link Claimed & Burned:**\n\n"
         f"👤 Reseller: **{res['reseller_name']}**\n"
         f"📦 Product: **{res['product_name']}** × {res['quantity']}\n"
-        f"💳 Credits deducted: **{res['credits_deducted']}** | {short} credits left: **{res['remaining_credits']}**\n\n"
+        f"💳 Deducted: **{res['charged_display']}** | Wallet balance left: **{res['balance_display']}**\n\n"
         f"🔗 **Your Single-Use Invite Link(s):**\n{_fmt_links(res['links'])}\n\n"
         "⚠️ *Each link is permanently burned from stock and reserved for you alone.*"
     )
@@ -561,8 +561,13 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
     is_whatsapp = session_rec.platform == "whatsapp"
     contact = (settings.admin_contact_number or "").strip()
 
-    qty_match = re.search(r"\b(\d{1,2})\s*(links?|credits?|pcs|pieces|qty)\b", msg)
-    quantity = int(qty_match.group(1)) if qty_match else 1
+    # Quantity: "2 links", "2 gemini links do", "gemini 3 link" — a standalone 1-2 digit number
+    # anywhere in the message when a unit word is present (365 in "office 365" is 3 digits -> ignored).
+    quantity = 1
+    if re.search(r"\b(links?|credits?|pcs|pieces|qty|keys?)\b", msg):
+        qty_match = re.search(r"(?<![\d.])(\d{1,2})(?![\d.])", msg)
+        if qty_match and 1 <= int(qty_match.group(1)) <= Config.MAX_CLAIM_QUANTITY:
+            quantity = int(qty_match.group(1))
 
     reseller_intent = any(k in msg for k in ("reseller", "credit", "wallet", "balance", "link do", "link chahiye", "claim"))
 
@@ -572,7 +577,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         c = f" Contact *{contact}* to pay and get reseller access." if contact else " Please contact the admin to pay and get reseller access."
         return (
             "ℹ️ Aapka ye number reseller ke roop me registered nahi hai.\n\n"
-            f"1 Credit = ₹{settings.reseller_credit_rate_inr:,.0f} (1 credit = 1 single-use link)."
+            f"Reseller ke paas ek wallet hota hai (min top-up ₹{settings.reseller_credit_rate_inr:,.0f}); har link ka reseller price wallet se katta hai."
             f"{c}\n\n"
             "Ya aap normal customer ki tarah bhi kharid sakte ho — bas product ka naam bhejo aur UPI se pay karo."
         )
@@ -586,7 +591,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             return (
                 f"❌ **Verification failed:** {auth_msg}\n\n"
                 "🌟 **Want to become a reseller?**\n"
-                f"1 Credit = ₹{settings.reseller_credit_rate_inr:,.0f}. Pay via UPI `{settings.admin_upi_id}` and contact the admin for your 4-digit passcode."
+                f"Wallet me paise daal kar links lo (min top-up ₹{settings.reseller_credit_rate_inr:,.0f}). Pay via UPI `{settings.admin_upi_id}` and contact the admin for your 4-digit passcode."
             )
         session_rec.reseller_id = reseller.id
         session_rec.reseller_phone = reseller.phone
@@ -599,8 +604,9 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         return (
             "✅ **Reseller verified!**\n\n"
             f"👤 Name: **{reseller.name}**\n📱 Phone: **{reseller.phone}**\n"
-            f"💳 Aapke credits (per product):\n{_credits_lines(get_reseller_product_credits(db, reseller))}\n\n"
-            "Reply with the product you want (e.g. *'Gemini ki link do'*). Sirf un products ki link milegi jinke credits hain."
+            f"💰 Wallet balance: **{reseller.money()}**\n\n"
+            f"Aapke liye link prices:\n{_reseller_prices_lines(db, reseller)}\n\n"
+            "Reply with the product you want (e.g. *'Gemini ki link do'*) — price wallet se kat jayega."
         )
 
     # 2. Already-verified reseller (web-verified or WhatsApp auto-verified by number)
@@ -615,9 +621,9 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             if (asks_balance or is_greeting) and not product:
                 first_name = reseller.name.split(" (")[0].split()[0] if reseller.name else "Reseller"
                 return (
-                    f"👋 Hello **{first_name}** sir! Aapke paas ye balance hai:\n"
-                    f"{_credits_lines(get_reseller_product_credits(db, reseller))}\n\n"
-                    "Kya aapko koi link chahiye? Bas product ka naam bhejo (jaise *'Gemini ki link do'*)."
+                    f"👋 Hello **{first_name}** sir! Aapke paas **{reseller.money()}** balance hai.\n\n"
+                    "Kya aapko koi link chahiye? Bas product ka naam bhejo (jaise *'Gemini ki link do'*).\n\n"
+                    f"Link prices (aapke liye):\n{_reseller_prices_lines(db, reseller)}"
                 )
             if product and not any(k in msg for k in _CATALOG_KEYWORDS):
                 return _reseller_claim_reply(process_reseller_claim_for(reseller, product, quantity, db))
@@ -630,7 +636,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             return (
                 f"💰 **{named.name}**\n\n"
                 f"• Customer price: **₹{named.get_customer_price():,.2f}**\n"
-                f"• Reseller cost: **{named.credit_cost} credit**\n"
+                f"• Reseller price: **₹{named.get_reseller_price():,.2f}** (wallet se katta hai)\n"
                 f"• Stock: {'✅ ' + str(stock) + ' available' if stock else '❌ Out of stock'}\n"
                 f"• {named.description}\n\n"
                 f"Reply *'buy {named.name.split(' (')[0]}'* to order, or send your reseller phone + 4-digit code to claim."
@@ -661,10 +667,10 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         for p in products:
             stock = stock_map.get(p.id, 0)
             badge = f"✅ {stock} in stock" if stock > 0 else "❌ Out of stock"
-            out += f"• **{p.name}** — ₹{p.get_customer_price():,.2f} · {p.credit_cost} credit · {badge}\n"
+            out += f"• **{p.name}** — ₹{p.get_customer_price():,.2f} · reseller ₹{p.get_reseller_price():,.0f} · {badge}\n"
         if shown_total > len(products):
             out += f"\n…aur {shown_total - len(products)} products hain. Brand/naam bhejo (jaise *'notion'*, *'canva pro'*) to exact product dikhaunga.\n"
-        out += "\n💡 *Kharidne ke liye product ka naam bhejo. Reseller: bas product ka naam bhejo, credits se link milegi.*"
+        out += "\n💡 *Kharidne ke liye product ka naam bhejo. Reseller: bas product ka naam bhejo, wallet se price kat kar link milegi.*"
         return out
 
     # 4. Payment reference for this conversation's pending order
@@ -742,6 +748,6 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
     return (
         f"👋 **Welcome to {settings.business_name}!**\n\n"
         "1. 🛍️ **Customer** - say *'products'* to see live prices and buy via UPI.\n"
-        "2. 🔑 **Reseller** - send your registered phone number + 4-digit passcode to claim links with credits.\n\n"
+        "2. 🔑 **Reseller** - send your registered phone number + 4-digit passcode; link prices are deducted from your wallet.\n\n"
         "How can I help you today?"
     )

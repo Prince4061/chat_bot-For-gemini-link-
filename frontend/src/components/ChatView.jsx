@@ -148,11 +148,11 @@ export default function ChatView({
             </div>
 
             <button
-              onClick={() => handleQuickAction('How can I become a reseller and buy credit packs?')}
+              onClick={() => handleQuickAction('Reseller kaise banein aur wallet me paise kaise daalein?')}
               className="mt-4 text-xs text-[#8e8ea0] hover:text-[#ececec] transition-colors inline-flex items-center gap-1"
             >
               <CreditCard className="w-3.5 h-3.5" />
-              Reseller banna chahte ho? Credit packs dekho →
+              Reseller banna chahte ho? Wallet top-up kaise hota hai →
             </button>
           </div>
         )}
@@ -269,16 +269,16 @@ export default function ChatView({
                   onChange={(e) => setSelectedProduct(e.target.value)}
                   className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] focus:outline-none focus:border-white/15"
                 >
-                  <option value="Gemini Advanced">Gemini Advanced (1-Year Invite Link) - 1 Credit</option>
-                  <option value="Claude Pro">Claude Pro (Private Org Invite) - 1 Credit</option>
-                  <option value="ChatGPT Plus">ChatGPT Plus (1-Month Workspace) - 1 Credit</option>
-                  <option value="Canva Pro">Canva Pro (Lifetime Edu Invite) - 1 Credit</option>
-                  <option value="Office 365">Office 365 (5-Device Enterprise) - 1 Credit</option>
+                  <option value="Gemini Advanced">Gemini Advanced (1-Year Invite Link)</option>
+                  <option value="Claude Pro">Claude Pro (Private Org Invite)</option>
+                  <option value="ChatGPT Plus">ChatGPT Plus (1-Month Workspace)</option>
+                  <option value="Canva Pro">Canva Pro (Lifetime Edu Invite)</option>
+                  <option value="Office 365">Office 365 (5-Device Enterprise)</option>
                 </select>
               </div>
 
               <div className="p-2.5 bg-[#2f2f2f] border border-white/15 rounded-xl text-[11px] text-[#ececec]">
-                💡 1 Credit will be deducted automatically, and your single-use link will be delivered instantly in chat.
+                💡 Product ka reseller price aapke wallet se automatically katega, aur single-use link turant chat me milega.
               </div>
 
               <button

@@ -41,7 +41,7 @@ def test_reseller_flow_verify_then_claim_without_repeating_code(client, client_h
     reply = _chat(client, client_headers, sid, f"{fresh_product.name} ki link do")
     assert "Claimed & Burned" in reply
     db.expire_all()
-    assert db.query(dbm.Reseller).get(fresh_reseller.id).credits_balance == 4
+    assert db.query(dbm.Reseller).get(fresh_reseller.id).wallet_balance == 400.0   # ₹500 - ₹100
 
 
 def test_tools_remember_verified_reseller(db, fresh_product, fresh_reseller):
@@ -55,8 +55,8 @@ def test_tools_remember_verified_reseller(db, fresh_product, fresh_reseller):
         # No phone / code passed: the tool must use the session's verified reseller.
         claim = json.loads(agent_tools.claim_reseller_product_link.invoke({"product_name": fresh_product.slug, "quantity": 1}))
         assert claim["success"], claim
-        bal = json.loads(agent_tools.check_reseller_credits.invoke({}))
-        assert bal["credits_balance"] == 4
+        bal = json.loads(agent_tools.check_reseller_balance.invoke({}))
+        assert bal["wallet_balance"] == 400.0 and bal["balance_display"] == "₹400.00"
         json.loads(agent_tools.logout_reseller_session.invoke({}))
         claim2 = json.loads(agent_tools.claim_reseller_product_link.invoke({"product_name": fresh_product.slug}))
         assert claim2["error"] == "AUTH_REQUIRED"
@@ -129,16 +129,37 @@ def test_whatsapp_clears_stale_reseller_link_for_unregistered_number(db, fresh_r
     assert fresh_reseller.name not in out["message"]
 
 
-def test_whatsapp_registered_reseller_hi_shows_name_and_credits(db, fresh_product, fresh_reseller):
-    """A registered number saying just 'hi' gets name + per-product credits — no need to ask."""
+def test_whatsapp_registered_reseller_hi_shows_name_and_balance(db, fresh_product, fresh_reseller):
+    """A registered number saying just 'hi' gets 'Hello <name> sir! Aapke paas ₹500 balance hai' — no need to ask."""
     from agent_core import run_deep_agent_chat
     sid = f"wa_hi_{fresh_reseller.phone}"
     out = run_deep_agent_chat(sid, "hi", platform="whatsapp",
                               owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
     msg = out["message"]
     assert fresh_reseller.name.split()[0] in msg                      # greeted by first name ("Hello Test sir")
-    assert "balance" in msg.lower() and "link chahiye" in msg.lower()
-    assert fresh_product.name.split(" (")[0] in msg and "5" in msg   # its product + credit count
+    assert "₹500.00" in msg and "balance" in msg.lower() and "link chahiye" in msg.lower()
+    assert "Link prices" in msg and "₹" in msg.split("Link prices", 1)[1]   # per-link reseller prices listed
+
+
+def test_quantity_parsed_when_number_precedes_product_name(db, fresh_product, fresh_reseller):
+    """'2 <product> links do' must mean quantity 2 (₹200), not 1. With ₹500 it succeeds and
+    charges for two; with only ₹150 left it is refused instead of silently giving one link."""
+    from agent_core import run_deep_agent_chat
+    sid = f"wa_qty_{fresh_reseller.phone}"
+    kw = dict(platform="whatsapp", owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    out = run_deep_agent_chat(sid, f"2 {fresh_product.name} links do", **kw)["message"]
+    assert "× 2" in out and "₹200.00" in out and "₹300.00" in out            # 2 links, ₹500 -> ₹300
+    for i in range(3):                                                         # restock so only money can block
+        db.add(dbm.InviteLink(product_id=fresh_product.id, link_or_key=f"https://example.com/{fresh_product.slug}/extra{i}"))
+    db.commit()
+    # Deduct with a STALE in-memory object (still thinks ₹500): the wallet must still be adjusted
+    # atomically against the real DB value (₹300), never overwritten from memory.
+    res = dbm.adjust_reseller_wallet(db, fresh_reseller, -150)
+    assert res["success"] and res["new_balance"] == 150.0                     # ₹300 - ₹150, not ₹500 - ₹150
+    out = run_deep_agent_chat(sid, f"2 {fresh_product.name} links do", **kw)["message"]
+    assert "failed" in out.lower() and "₹200.00" in out                        # needs ₹200, has ₹150
+    db.refresh(fresh_reseller)
+    assert fresh_reseller.wallet_balance == 150.0                              # nothing deducted
 
 
 def test_whatsapp_customer_hi_asks_which_product_and_lists_catalogue(db):

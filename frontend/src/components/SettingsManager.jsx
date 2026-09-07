@@ -174,7 +174,7 @@ export default function SettingsManager() {
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
             <div>
-              <label className="block text-[#8e8ea0] mb-1 font-medium">Reseller Credit Unit Price (₹)</label>
+              <label className="block text-[#8e8ea0] mb-1 font-medium">Minimum Wallet Top-up (₹)</label>
               <input
                 type="number"
                 step="0.01"
@@ -182,7 +182,17 @@ export default function SettingsManager() {
                 onChange={(e) => setSettings({ ...settings, reseller_credit_rate_inr: parseFloat(e.target.value) || 0 })}
                 className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono focus:outline-none focus:border-white/15"
               />
-              <span className="text-[11px] text-[#8e8ea0] mt-1 block">Base cost: 1 Credit = ₹{settings.reseller_credit_rate_inr}</span>
+              <span className="text-[11px] text-[#8e8ea0] mt-1 block">Bot naye resellers ko yahi minimum top-up batata hai.</span>
+
+              <label className="block text-[#8e8ea0] mb-1 mt-3 font-medium">USD → INR rate (USD wallets ke liye)</label>
+              <input
+                type="number"
+                step="0.01"
+                value={settings.usd_to_inr_rate || 83}
+                onChange={(e) => setSettings({ ...settings, usd_to_inr_rate: parseFloat(e.target.value) || 0 })}
+                className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono focus:outline-none focus:border-white/15"
+              />
+              <span className="text-[11px] text-[#8e8ea0] mt-1 block">1 USD = ₹{settings.usd_to_inr_rate || 83}. USD-wallet reseller se INR product price isi rate se convert hoke katega.</span>
             </div>
 
             <div>

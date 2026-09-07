@@ -179,7 +179,7 @@ export default function BotTester() {
                         <div className="flex flex-wrap items-center gap-2 text-[#8e8ea0]">
                           <User className="w-3 h-3" />
                           {m.debug.session.reseller
-                            ? <span className="text-emerald-300">Reseller: {m.debug.session.reseller.name} · credits: {m.debug.session.reseller.credits}</span>
+                            ? <span className="text-emerald-300">Reseller: {m.debug.session.reseller.name} · wallet: {m.debug.session.reseller.balance}</span>
                             : <span>Not a verified reseller</span>}
                           {m.debug.session.pending_order && (
                             <span className="text-amber-300">· Pending order {m.debug.session.pending_order.id} ({m.debug.session.pending_order.product}, ₹{m.debug.session.pending_order.amount})</span>

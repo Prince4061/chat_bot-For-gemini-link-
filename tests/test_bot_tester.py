@@ -23,7 +23,7 @@ def test_bot_tester_whatsapp_mode_auto_verifies_reseller(client, admin_headers, 
     body = r.get_json()
     assert body["session_id"].startswith("test_whatsapp_")
     assert body["session"]["reseller"]["name"] == fresh_reseller.name          # identified by number, no code
-    assert fresh_product.name.split(" (")[0] in body["session"]["reseller"]["credits"]
+    assert body["session"]["reseller"]["balance"] == "₹500.00" and body["session"]["reseller"]["currency"] == "INR"
     assert fresh_reseller.name.split()[0] in body["reply"]           # "Hello <first name> sir!"
 
 

@@ -17,7 +17,7 @@ def _bulk_products(db, n=2000):
     for i in range(n):
         b, t = BRANDS[i % len(BRANDS)], TIERS[(i // len(BRANDS)) % len(TIERS)]
         rows.append(dbm.Product(name=f"{b} {t} S{i:05d}", slug=f"scale-{b.lower()}-{t.lower()}-s{i:05d}",
-                                category="ScaleTest", base_price=100, margin_percent=10, credit_cost=1))
+                                category="ScaleTest", base_price=100, margin_percent=10))
     db.bulk_save_objects(rows)
     db.commit()
     ids = [r[0] for r in db.query(dbm.Product.id).filter(dbm.Product.category == "ScaleTest").all()]

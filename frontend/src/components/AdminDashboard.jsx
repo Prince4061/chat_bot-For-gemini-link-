@@ -242,12 +242,12 @@ export default function AdminDashboard({ onSwitchToChat, onOpenSidebar }) {
               <div className="glass-panel rounded-2xl p-5 border border-white/10 flex items-center justify-between">
                 <div>
                   <span className="text-[11px] uppercase font-bold text-[#8e8ea0] tracking-wider block">
-                    Reseller Credits
+                    Reseller Wallets
                   </span>
                   <span className="text-2xl font-bold text-[#ececec] font-mono mt-1 block">
-                    {metrics?.total_credits_in_wallets ?? 0}
+                    ₹{Number(metrics?.total_wallet_balance_inr ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
                   </span>
-                  <span className="text-[11px] text-[#8e8ea0]">Across {metrics?.total_resellers ?? 0} Resellers</span>
+                  <span className="text-[11px] text-[#8e8ea0]">Across {metrics?.total_resellers ?? 0} Resellers (INR equiv.)</span>
                 </div>
                 <div className="w-10 h-10 rounded-xl bg-[#2f2f2f] border border-white/15 flex items-center justify-center text-[#ececec]">
                   <Users className="w-5 h-5" />
@@ -314,7 +314,7 @@ export default function AdminDashboard({ onSwitchToChat, onOpenSidebar }) {
                     <Users className="w-4 h-4 text-[#ececec]" />
                     <div>
                       <div className="font-bold text-xs text-[#ececec]">Top-up Reseller Wallet</div>
-                      <div className="text-[11px] text-[#8e8ea0]">Add or deduct credits</div>
+                      <div className="text-[11px] text-[#8e8ea0]">Wallet me paise add / deduct karo</div>
                     </div>
                   </div>
                   <ArrowRight className="w-3.5 h-3.5 text-[#8e8ea0]" />

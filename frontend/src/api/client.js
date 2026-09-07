@@ -127,11 +127,9 @@ export const adminApi = {
   createReseller: async (resellerData) => (await api.post('/admin/resellers', resellerData)).data,
   updateReseller: async (id, resellerData) => (await api.put(`/admin/resellers/${id}`, resellerData)).data,
   unlockReseller: async (id) => (await api.post(`/admin/resellers/${id}/unlock`)).data,
-  // Credits are PER PRODUCT: productId is required.
-  adjustCredits: async (id, productId, amount, reason = 'admin_topup', note = '') =>
-    (await api.post(`/admin/resellers/${id}/credits`, { product_id: parseInt(productId), amount: parseInt(amount), reason, note })).data,
-  assignLegacyCredits: async (id, productId, amount) =>
-    (await api.post(`/admin/resellers/${id}/assign-legacy`, { product_id: parseInt(productId), amount: parseInt(amount) })).data,
+  // Money wallet: + adds, − deducts (in the reseller's currency)
+  adjustWallet: async (id, amount, reason = 'admin_topup', note = '') =>
+    (await api.post(`/admin/resellers/${id}/wallet`, { amount: parseFloat(amount), reason, note })).data,
   getResellerTransactions: async (id) => (await api.get(`/admin/resellers/${id}/transactions`)).data,
 
   getOrders: async (status = '') => (await api.get('/admin/orders', { params: status ? { status } : {} })).data,
