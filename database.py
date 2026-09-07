@@ -100,9 +100,11 @@ class Product(Base):
     category = Column(String(50), default="AI Tools")
     description = Column(Text, default="")
     base_price = Column(Float, nullable=False, default=0.0)        # Admin cost
-    margin_percent = Column(Float, nullable=False, default=30.0)   # Live margin %
+    margin_percent = Column(Float, nullable=False, default=30.0)   # CUSTOMER margin % over base
+    reseller_margin_percent = Column(Float, nullable=False, default=0.0)  # RESELLER margin % over base
     credit_cost = Column(Integer, nullable=False, default=1)       # legacy (credits era), unused
-    # What a RESELLER pays per link, in INR. NULL = same as base_price.
+    # Legacy explicit reseller price (INR). Converted to reseller_margin_percent on start-up;
+    # if still set it wins over the margin (kept only for backward compatibility).
     reseller_price = Column(Float, nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
@@ -114,8 +116,12 @@ class Product(Base):
         return round(self.base_price + self.base_price * (self.margin_percent / 100.0), 2)
 
     def get_reseller_price(self) -> float:
-        """Reseller pays this per link (INR). Defaults to the base price when not set."""
-        return round(float(self.reseller_price if self.reseller_price is not None else self.base_price), 2)
+        """Reseller price = base + base * reseller_margin% / 100 (INR), computed live like the
+        customer price. A legacy explicit reseller_price, if still set, overrides it."""
+        if self.reseller_price is not None:
+            return round(float(self.reseller_price), 2)
+        rm = float(self.reseller_margin_percent or 0.0)
+        return round(self.base_price + self.base_price * (rm / 100.0), 2)
 
     def get_available_stock_count(self, session) -> int:
         return session.query(func.count(InviteLink.id)).filter(
@@ -137,6 +143,7 @@ class Product(Base):
             "margin_percent": self.margin_percent,
             "customer_price": self.get_customer_price(),
             "credit_cost": self.credit_cost,
+            "reseller_margin_percent": float(self.reseller_margin_percent or 0.0),
             "reseller_price": self.get_reseller_price(),
             "reseller_price_set": self.reseller_price is not None,
             "is_active": self.is_active,
@@ -1316,6 +1323,29 @@ def _migrate_credits_to_wallet(db) -> None:
         logger.info("Converted old credits into wallet money for %d reseller(s).", migrated)
 
 
+def _migrate_reseller_price_to_margin(db) -> None:
+    """
+    Reseller pricing is now a margin % over base (its own slider), like the customer price.
+    Convert any legacy explicit reseller_price into the equivalent margin once, so admins keep
+    the prices they had configured. Idempotent: reseller_price is cleared after conversion.
+    """
+    changed = 0
+    for p in db.query(Product).filter(Product.reseller_price.isnot(None)).all():
+        if p.base_price and p.base_price > 0:
+            p.reseller_margin_percent = round((float(p.reseller_price) / float(p.base_price) - 1.0) * 100.0, 2)
+        else:
+            p.reseller_margin_percent = 0.0
+        p.reseller_price = None
+        changed += 1
+    # Column added by _ensure_columns has NULLs on old rows -> normalise to 0.
+    for p in db.query(Product).filter(Product.reseller_margin_percent.is_(None)).all():
+        p.reseller_margin_percent = 0.0
+        changed += 1
+    if changed:
+        db.commit()
+        logger.info("Normalised reseller pricing to margin %% for %d product(s).", changed)
+
+
 def init_db() -> None:
     """Create tables, apply light migrations, seed demo data on first run."""
     Base.metadata.create_all(bind=engine)
@@ -1325,6 +1355,7 @@ def init_db() -> None:
         if db.query(Product).count() == 0:
             seed_data(db)
             logger.info("Seeded demo products, links and resellers.")
+        _migrate_reseller_price_to_margin(db)
         _migrate_credits_to_wallet(db)
     finally:
         db.close()

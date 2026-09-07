@@ -510,7 +510,7 @@ def _validate_product_payload(data: dict, partial: bool = False):
     if not partial or "name" in data:
         if not str(data.get("name", "")).strip():
             errors.append("name is required")
-    for field, lo, hi in (("base_price", 0, 10_000_000), ("margin_percent", 0, 10_000)):
+    for field, lo, hi in (("base_price", 0, 10_000_000), ("margin_percent", 0, 10_000), ("reseller_margin_percent", 0, 10_000)):
         if field in data or not partial:
             try:
                 val = float(data.get(field, 0))
@@ -591,8 +591,10 @@ def create_admin_product():
             description=str(data.get("description", ""))[:2000],
             base_price=float(data.get("base_price", 0.0)),
             margin_percent=float(data.get("margin_percent", 30.0)),
+            reseller_margin_percent=float(data.get("reseller_margin_percent", 0.0) or 0.0),
             credit_cost=int(data.get("credit_cost", 1) or 1),
-            reseller_price=_reseller_price_from(data),
+            # Legacy explicit price still accepted; the margin slider is the primary control.
+            reseller_price=_reseller_price_from(data) if "reseller_margin_percent" not in data else None,
             is_active=bool(data.get("is_active", True)),
         )
         db.add(product)
@@ -619,8 +621,12 @@ def update_admin_product(prod_id):
         if "description" in data: product.description = str(data["description"])[:2000]
         if "base_price" in data: product.base_price = float(data["base_price"])
         if "margin_percent" in data: product.margin_percent = float(data["margin_percent"])
+        if "reseller_margin_percent" in data:
+            product.reseller_margin_percent = float(data["reseller_margin_percent"] or 0.0)
+            product.reseller_price = None   # the slider now drives the reseller price
         if "credit_cost" in data: product.credit_cost = int(data["credit_cost"] or 1)
-        if "reseller_price" in data: product.reseller_price = _reseller_price_from(data)
+        if "reseller_price" in data and "reseller_margin_percent" not in data:
+            product.reseller_price = _reseller_price_from(data)
         if "is_active" in data: product.is_active = bool(data["is_active"])
         db.commit()
         return jsonify(product.to_dict(db))
@@ -631,7 +637,9 @@ def update_admin_product(prod_id):
 @app.route("/api/admin/products/<int:prod_id>/margin", methods=["POST"])
 @require_admin
 def update_product_margin_instant(prod_id):
-    """Instant margin change - the agent quotes the new price on the very next turn."""
+    """Instant margin change (customer and/or reseller slider) - the agent quotes the new
+    prices on the very next turn: customer margin -> customer price, reseller margin -> what a
+    reseller's wallet is charged per link."""
     data = _payload()
     try:
         new_margin = float(data.get("margin_percent"))
@@ -639,14 +647,27 @@ def update_product_margin_instant(prod_id):
         return jsonify({"error": "margin_percent must be a number"}), 400
     if not (0 <= new_margin <= 10_000):
         return jsonify({"error": "margin_percent out of range"}), 400
+    new_reseller_margin = None
+    if data.get("reseller_margin_percent") not in (None, ""):
+        try:
+            new_reseller_margin = float(data["reseller_margin_percent"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "reseller_margin_percent must be a number"}), 400
+        if not (0 <= new_reseller_margin <= 10_000):
+            return jsonify({"error": "reseller_margin_percent out of range"}), 400
     db = get_db()
     try:
         product = db.query(Product).filter(Product.id == prod_id).first()
         if not product:
             return jsonify({"error": "Product not found"}), 404
         product.margin_percent = new_margin
+        if new_reseller_margin is not None:
+            product.reseller_margin_percent = new_reseller_margin
+            product.reseller_price = None   # slider is now the source of truth
         db.commit()
-        logger.info("Margin for %s set to %.2f%% -> price %.2f", product.slug, new_margin, product.get_customer_price())
+        logger.info("Margins for %s: customer %.2f%% -> ₹%.2f, reseller %.2f%% -> ₹%.2f", product.slug,
+                    product.margin_percent, product.get_customer_price(),
+                    float(product.reseller_margin_percent or 0), product.get_reseller_price())
         return jsonify({
             "success": True,
             "product_id": product.id,
@@ -654,6 +675,8 @@ def update_product_margin_instant(prod_id):
             "base_price": product.base_price,
             "new_margin_percent": product.margin_percent,
             "new_live_customer_price": product.get_customer_price(),
+            "new_reseller_margin_percent": float(product.reseller_margin_percent or 0),
+            "new_live_reseller_price": product.get_reseller_price(),
         })
     finally:
         db.close()

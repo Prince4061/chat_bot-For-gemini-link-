@@ -20,30 +20,17 @@ export default function ProductManager() {
   const [savingMarginId, setSavingMarginId] = useState(null);
   const [successMsg, setSuccessMsg] = useState('');
 
-  // Form state
+  // Form state — two margins over the same base cost: one for customers, one for resellers.
   const [formData, setFormData] = useState({
     name: '',
     category: 'AI Models',
     description: '',
     base_price: 300,
     margin_percent: 35,
-    reseller_price: ''
+    reseller_margin_percent: 10
   });
-  const [resellerPriceDraft, setResellerPriceDraft] = useState({});
 
-  const saveResellerPrice = async (p) => {
-    const raw = resellerPriceDraft[p.id];
-    if (raw === undefined) return;
-    try {
-      await adminApi.updateProduct(p.id, { reseller_price: raw === '' ? null : parseFloat(raw) });
-      setSuccessMsg(`Reseller price updated for ${p.name}.`);
-      setTimeout(() => setSuccessMsg(''), 3000);
-      setResellerPriceDraft((d) => { const n = { ...d }; delete n[p.id]; return n; });
-      loadProducts();
-    } catch (err) {
-      alert('Failed to update reseller price: ' + err.message);
-    }
-  };
+  const priceWithMargin = (base, pct) => Math.round((base + (base * (parseFloat(pct) || 0) / 100)) * 100) / 100;
 
   const loadProducts = async () => {
     try {
@@ -61,29 +48,27 @@ export default function ProductManager() {
     loadProducts();
   }, []);
 
-  const handleMarginChange = (id, newMargin) => {
+  // Live-preview either slider; prices are recomputed locally until "Apply" saves them.
+  const handleMarginChange = (id, field, value) => {
     setProducts(products.map(p => {
-      if (p.id === id) {
-        const marginVal = parseFloat(newMargin) || 0;
-        const newCustomerPrice = p.base_price + (p.base_price * marginVal / 100);
-        return {
-          ...p,
-          margin_percent: marginVal,
-          customer_price: Math.round(newCustomerPrice * 100) / 100
-        };
-      }
-      return p;
+      if (p.id !== id) return p;
+      const v = parseFloat(value) || 0;
+      const next = { ...p, [field]: v };
+      next.customer_price = priceWithMargin(p.base_price, next.margin_percent);
+      next.reseller_price = priceWithMargin(p.base_price, next.reseller_margin_percent);
+      return next;
     }));
   };
 
-  const handleSaveMargin = async (id, marginVal) => {
+  const handleSaveMargin = async (p) => {
     try {
-      setSavingMarginId(id);
-      await adminApi.updateMargin(id, marginVal);
-      setSuccessMsg(`Margin updated! Deep Agent is now quoting live price instantly.`);
-      setTimeout(() => setSuccessMsg(''), 3500);
+      setSavingMarginId(p.id);
+      await adminApi.updateMargin(p.id, p.margin_percent, p.reseller_margin_percent);
+      setSuccessMsg(`Saved! Bot ab customer ko ₹${priceWithMargin(p.base_price, p.margin_percent).toFixed(2)} aur reseller ko ₹${priceWithMargin(p.base_price, p.reseller_margin_percent).toFixed(2)} quote karega.`);
+      setTimeout(() => setSuccessMsg(''), 4000);
+      loadProducts();
     } catch (err) {
-      alert('Failed to update margin: ' + err.message);
+      alert('Failed to update margins: ' + err.message);
     } finally {
       setSavingMarginId(null);
     }
@@ -100,7 +85,7 @@ export default function ProductManager() {
         description: '',
         base_price: 300,
         margin_percent: 35,
-        reseller_price: ''
+        reseller_margin_percent: 10
       });
       loadProducts();
     } catch (err) {
@@ -202,70 +187,73 @@ export default function ProductManager() {
                     <span className="font-semibold text-[#d4d4d4]">₹{p.base_price.toFixed(2)}</span>
                   </div>
 
-                  {/* Dynamic Margin Slider & Input */}
+                  {/* Slider 1: CUSTOMER margin */}
                   <div className="space-y-1">
                     <div className="flex justify-between items-center text-xs">
                       <span className="text-[#ececec] font-medium flex items-center gap-1">
                         <TrendingUp className="w-3 h-3" />
-                        Dynamic Margin:
+                        Customer Margin:
                       </span>
                       <div className="flex items-center gap-1">
                         <input
-                          type="number"
-                          min="0"
-                          max="300"
+                          type="number" min="0" max="300"
                           value={p.margin_percent}
-                          onChange={(e) => handleMarginChange(p.id, e.target.value)}
+                          onChange={(e) => handleMarginChange(p.id, 'margin_percent', e.target.value)}
                           className="w-16 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] font-bold focus:outline-none focus:border-white/15"
                         />
                         <span className="text-xs text-[#8e8ea0]">%</span>
                       </div>
                     </div>
-
                     <input
-                      type="range"
-                      min="0"
-                      max="150"
+                      type="range" min="0" max="150"
                       value={p.margin_percent}
-                      onChange={(e) => handleMarginChange(p.id, e.target.value)}
+                      onChange={(e) => handleMarginChange(p.id, 'margin_percent', e.target.value)}
                       className="w-full accent-emerald-500 h-1.5 bg-[#3a3a3a] rounded-lg cursor-pointer"
                     />
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-[#ececec] font-bold">Live Customer Price:</span>
+                      <span className="text-sm font-bold text-emerald-300">₹{p.customer_price.toFixed(2)}</span>
+                    </div>
                   </div>
 
-                  <div className="pt-2 border-t border-white/10 flex justify-between items-center text-xs">
-                    <span className="text-[#ececec] font-bold">Live Customer Price:</span>
-                    <span className="text-sm font-bold text-[#ececec]">
-                      ₹{p.customer_price.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="flex justify-between items-center text-[11px] text-[#8e8ea0] mb-3 px-1 gap-2">
-                  <span title="Reseller ke wallet se itna katta hai per link">Reseller Price (₹/link):</span>
-                  <div className="flex items-center gap-1">
+                  {/* Slider 2: RESELLER margin */}
+                  <div className="space-y-1 pt-2 border-t border-white/10">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-[#ececec] font-medium flex items-center gap-1">
+                        <TrendingUp className="w-3 h-3" />
+                        Reseller Margin:
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <input
+                          type="number" min="0" max="300"
+                          value={p.reseller_margin_percent ?? 0}
+                          onChange={(e) => handleMarginChange(p.id, 'reseller_margin_percent', e.target.value)}
+                          className="w-16 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] font-bold focus:outline-none focus:border-white/15"
+                        />
+                        <span className="text-xs text-[#8e8ea0]">%</span>
+                      </div>
+                    </div>
                     <input
-                      type="number" step="0.01" min="0"
-                      value={resellerPriceDraft[p.id] ?? (p.reseller_price_set ? p.reseller_price : '')}
-                      placeholder={`= base ₹${p.base_price.toFixed(0)}`}
-                      onChange={(e) => setResellerPriceDraft((d) => ({ ...d, [p.id]: e.target.value }))}
-                      onBlur={() => saveResellerPrice(p)}
-                      onKeyDown={(e) => e.key === 'Enter' && e.target.blur()}
-                      className="w-24 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] font-mono font-bold focus:outline-none focus:border-white/25"
+                      type="range" min="0" max="150"
+                      value={p.reseller_margin_percent ?? 0}
+                      onChange={(e) => handleMarginChange(p.id, 'reseller_margin_percent', e.target.value)}
+                      className="w-full accent-sky-400 h-1.5 bg-[#3a3a3a] rounded-lg cursor-pointer"
                     />
-                    {!p.reseller_price_set && resellerPriceDraft[p.id] === undefined && (
-                      <span className="text-[10px] text-[#8e8ea0]">(= base)</span>
-                    )}
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-[#ececec] font-bold" title="Reseller ke wallet se itna katta hai per link">Live Reseller Price:</span>
+                      <span className="text-sm font-bold text-sky-300">₹{Number(p.reseller_price).toFixed(2)}</span>
+                    </div>
                   </div>
                 </div>
               </div>
 
-              {/* Instant Save Button */}
+              {/* Saves both margins */}
               <button
-                onClick={() => handleSaveMargin(p.id, p.margin_percent)}
+                onClick={() => handleSaveMargin(p)}
                 disabled={savingMarginId === p.id}
                 className="w-full py-2 bg-white hover:bg-white/90 disabled:opacity-50 text-black font-bold text-xs rounded-xl transition-all shadow-md active:scale-98 flex items-center justify-center gap-1.5"
               >
-                {savingMarginId === p.id ? 'Updating Live Price...' : 'Apply Live Margin'}
+                {savingMarginId === p.id ? 'Updating Live Prices...' : 'Apply Live Margins'}
               </button>
             </div>
           ))}
@@ -311,14 +299,13 @@ export default function ProductManager() {
                 </div>
 
                 <div>
-                  <label className="block text-[#8e8ea0] mb-1 font-medium">Reseller Price (₹/link)</label>
+                  <label className="block text-[#8e8ea0] mb-1 font-medium">Reseller Margin (%)</label>
                   <input
                     type="number"
                     min="0"
                     step="0.01"
-                    placeholder="blank = base price"
-                    value={formData.reseller_price}
-                    onChange={(e) => setFormData({ ...formData, reseller_price: e.target.value })}
+                    value={formData.reseller_margin_percent}
+                    onChange={(e) => setFormData({ ...formData, reseller_margin_percent: parseFloat(e.target.value) || 0 })}
                     className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] focus:outline-none focus:border-white/15"
                   />
                 </div>
@@ -361,8 +348,9 @@ export default function ProductManager() {
                 />
               </div>
 
-              <div className="p-3 bg-[#2f2f2f] rounded-xl border border-white/15 text-[#ececec]">
-                Calculated Initial Customer Selling Price: <strong>₹{(formData.base_price + (formData.base_price * formData.margin_percent / 100)).toFixed(2)}</strong>
+              <div className="p-3 bg-[#2f2f2f] rounded-xl border border-white/15 text-[#ececec] space-y-1">
+                <div>Customer price: <strong className="text-emerald-300">₹{priceWithMargin(formData.base_price, formData.margin_percent).toFixed(2)}</strong> <span className="text-[#8e8ea0]">(base + {formData.margin_percent || 0}%)</span></div>
+                <div>Reseller price: <strong className="text-sky-300">₹{priceWithMargin(formData.base_price, formData.reseller_margin_percent).toFixed(2)}</strong> <span className="text-[#8e8ea0]">(base + {formData.reseller_margin_percent || 0}%, wallet se katega)</span></div>
               </div>
 
               <div className="flex gap-2 pt-2">

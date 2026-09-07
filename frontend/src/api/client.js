@@ -106,8 +106,14 @@ export const adminApi = {
   getProducts: async () => (await api.get('/admin/products')).data,
   createProduct: async (productData) => (await api.post('/admin/products', productData)).data,
   updateProduct: async (id, productData) => (await api.put(`/admin/products/${id}`, productData)).data,
-  updateMargin: async (id, marginPercent) =>
-    (await api.post(`/admin/products/${id}/margin`, { margin_percent: parseFloat(marginPercent) })).data,
+  // Saves BOTH sliders: customer margin % and reseller margin % (each over base price).
+  updateMargin: async (id, marginPercent, resellerMarginPercent) => {
+    const body = { margin_percent: parseFloat(marginPercent) };
+    if (resellerMarginPercent !== undefined && resellerMarginPercent !== null && resellerMarginPercent !== '') {
+      body.reseller_margin_percent = parseFloat(resellerMarginPercent);
+    }
+    return (await api.post(`/admin/products/${id}/margin`, body)).data;
+  },
   deleteProduct: async (id) => (await api.delete(`/admin/products/${id}`)).data,
 
   getInventory: async (status = '', productId = '') => {
