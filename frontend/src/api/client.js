@@ -127,8 +127,11 @@ export const adminApi = {
   createReseller: async (resellerData) => (await api.post('/admin/resellers', resellerData)).data,
   updateReseller: async (id, resellerData) => (await api.put(`/admin/resellers/${id}`, resellerData)).data,
   unlockReseller: async (id) => (await api.post(`/admin/resellers/${id}/unlock`)).data,
-  adjustCredits: async (id, amount, reason = 'admin_topup', note = '') =>
-    (await api.post(`/admin/resellers/${id}/credits`, { amount: parseInt(amount), reason, note })).data,
+  // Credits are PER PRODUCT: productId is required.
+  adjustCredits: async (id, productId, amount, reason = 'admin_topup', note = '') =>
+    (await api.post(`/admin/resellers/${id}/credits`, { product_id: parseInt(productId), amount: parseInt(amount), reason, note })).data,
+  assignLegacyCredits: async (id, productId, amount) =>
+    (await api.post(`/admin/resellers/${id}/assign-legacy`, { product_id: parseInt(productId), amount: parseInt(amount) })).data,
   getResellerTransactions: async (id) => (await api.get(`/admin/resellers/${id}/transactions`)).data,
 
   getOrders: async (status = '') => (await api.get('/admin/orders', { params: status ? { status } : {} })).data,
@@ -138,6 +141,10 @@ export const adminApi = {
 
   getSettings: async () => (await api.get('/admin/settings')).data,
   updateSettings: async (settingsData) => (await api.post('/admin/settings', settingsData)).data,
+
+  // Bot Tester (live chat with debug info)
+  botTest: async (payload) => (await api.post('/admin/bot/test', payload)).data,
+  botTestReset: async (sessionId) => (await api.post('/admin/bot/test/reset', { session_id: sessionId })).data,
 
   // AI training (Knowledge Base / FAQ)
   getKnowledge: async () => (await api.get('/admin/knowledge')).data,

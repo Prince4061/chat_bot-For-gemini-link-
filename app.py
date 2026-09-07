@@ -44,9 +44,13 @@ from database import (  # noqa: E402  (config must load first)
     ChatSessionRecord,
     ChatMessageRecord,
     KnowledgeEntry,
+    ResellerCredit,
     fulfill_order,
     normalize_phone,
     is_valid_secret_code,
+    adjust_reseller_product_credits,
+    assign_legacy_credits,
+    stock_counts_by_product,
 )
 from agent_core import run_deep_agent_chat, agent_status, test_llm_connection, invalidate_agent_cache  # noqa: E402
 from evolution_service import parse_evolution_webhook_payload, send_whatsapp_message  # noqa: E402
@@ -469,11 +473,13 @@ def get_admin_metrics():
         revenue = db.query(func.coalesce(func.sum(CustomerOrder.total_amount), 0.0)).filter(CustomerOrder.status.in_(["delivered", "fulfillment_pending"])).scalar() or 0.0
         pending_orders = db.query(func.count(CustomerOrder.id)).filter(CustomerOrder.status == "pending_payment").scalar() or 0
         needs_fulfilment = db.query(func.count(CustomerOrder.id)).filter(CustomerOrder.status == "fulfillment_pending").scalar() or 0
+        # One aggregate query for stock (scales to large catalogues); cap the alert list.
+        stock_map = stock_counts_by_product(db)
         low_stock = [
-            {"id": p.id, "name": p.name, "stock": p.get_available_stock_count(db)}
-            for p in db.query(Product).filter(Product.is_active == True).all()  # noqa: E712
-            if p.get_available_stock_count(db) <= 2
-        ]
+            {"id": pid, "name": name, "stock": stock_map.get(pid, 0)}
+            for pid, name in db.query(Product.id, Product.name).filter(Product.is_active == True).order_by(Product.id).all()  # noqa: E712
+            if stock_map.get(pid, 0) <= 2
+        ][:25]
         recent_claims = db.query(InviteLink).filter(InviteLink.status == "claimed").order_by(InviteLink.claimed_at.desc()).limit(8).all()
         return jsonify({
             "total_products": total_products,
@@ -526,9 +532,27 @@ def _slugify(text_value: str) -> str:
 @app.route("/api/admin/products", methods=["GET"])
 @require_admin
 def list_admin_products():
+    """Product list with stock computed in ONE aggregate query. Optional ?q= search,
+    ?limit=/?offset= paging for very large catalogues (default: all, for the current UI)."""
     db = get_db()
     try:
-        return jsonify([p.to_dict(db) for p in db.query(Product).order_by(Product.id.asc()).all()])
+        q = db.query(Product)
+        term = (request.args.get("q") or "").strip()
+        if term:
+            q = q.filter((Product.name.ilike(f"%{term}%")) | (Product.slug.ilike(f"%{term}%")))
+        try:
+            limit = int(request.args.get("limit", 0) or 0)
+            offset = int(request.args.get("offset", 0) or 0)
+        except ValueError:
+            limit, offset = 0, 0
+        q = q.order_by(Product.id.asc())
+        if offset:
+            q = q.offset(offset)
+        if limit:
+            q = q.limit(min(limit, 5000))
+        products = q.all()
+        stock_map = stock_counts_by_product(db, [p.id for p in products])
+        return jsonify([p.to_dict(stock=stock_map.get(p.id, 0)) for p in products])
     finally:
         db.close()
 
@@ -826,19 +850,27 @@ def create_admin_reseller():
     try:
         if db.query(Reseller).filter(Reseller.phone == phone).first():
             return jsonify({"error": "A reseller with this phone number already exists"}), 409
+        # Initial credits must be tied to a product (credits are per product now).
+        product = None
+        if credits > 0:
+            pid = data.get("product_id")
+            product = db.query(Product).filter(Product.id == int(pid)).first() if pid and str(pid).isdigit() else None
+            if not product:
+                return jsonify({"error": "product_id is required when giving initial credits (credits are per product)"}), 400
+
         reseller = Reseller(
             name=str(data.get("name") or "New Reseller").strip()[:100],
             phone=phone,
             secret_code=secret_code,
-            credits_balance=credits,
+            credits_balance=0,
             is_active=bool(data.get("is_active", True)),
             notes=str(data.get("notes", ""))[:2000],
         )
         db.add(reseller)
         db.commit()
-        if credits > 0:
-            db.add(CreditTransaction(reseller_id=reseller.id, amount=credits, balance_after=credits, reason="admin_topup", reference_note="Initial onboarding credits"))
-            db.commit()
+        if credits > 0 and product:
+            adjust_reseller_product_credits(db, reseller, product, credits, reason="admin_topup", note="Initial onboarding credits")
+        db.refresh(reseller)
         return jsonify(reseller.to_dict()), 201
     finally:
         db.close()
@@ -905,19 +937,53 @@ def adjust_reseller_credits(res_id):
         return jsonify({"error": "amount must be non-zero and within ±100000"}), 400
     reason = str(data.get("reason") or ("admin_topup" if amount > 0 else "admin_deduct"))[:50]
     note = str(data.get("note") or "Manual admin credit adjustment")[:500]
+    pid = data.get("product_id")
+    if not pid or not str(pid).isdigit():
+        return jsonify({"error": "product_id is required — credits are given per product"}), 400
 
     db = get_db()
     try:
         reseller = db.query(Reseller).filter(Reseller.id == res_id).first()
         if not reseller:
             return jsonify({"error": "Reseller not found"}), 404
-        if reseller.credits_balance + amount < 0:
-            return jsonify({"error": f"Cannot deduct {abs(amount)}: balance is only {reseller.credits_balance}"}), 400
-        reseller.credits_balance += amount
-        db.add(CreditTransaction(reseller_id=reseller.id, amount=amount, balance_after=reseller.credits_balance, reason=reason, reference_note=note))
-        db.commit()
-        logger.info("Admin adjusted credits for %s by %+d (now %d)", reseller.phone, amount, reseller.credits_balance)
-        return jsonify({"success": True, "reseller_id": reseller.id, "reseller_name": reseller.name, "change": amount, "new_balance": reseller.credits_balance})
+        product = db.query(Product).filter(Product.id == int(pid)).first()
+        if not product:
+            return jsonify({"error": "Product not found"}), 404
+        result = adjust_reseller_product_credits(db, reseller, product, amount, reason=reason, note=note)
+        if not result.get("success"):
+            return jsonify({"error": result.get("message")}), 400
+        logger.info("Admin adjusted %s credits for %s by %+d (now %d for it, %d total)",
+                    product.slug, reseller.phone, amount, result["credits_for_product"], result["total_credits"])
+        return jsonify({"success": True, "reseller_id": reseller.id, "reseller_name": reseller.name,
+                        "product_id": product.id, "product_name": product.name, "change": amount,
+                        "credits_for_product": result["credits_for_product"], "new_balance": result["total_credits"],
+                        "reseller": reseller.to_dict()})
+    finally:
+        db.close()
+
+
+@app.route("/api/admin/resellers/<int:res_id>/assign-legacy", methods=["POST"])
+@require_admin
+def assign_legacy_reseller_credits(res_id):
+    """Move old generic wallet credits onto a product so they become claimable."""
+    data = _payload()
+    pid = data.get("product_id")
+    try:
+        amount = int(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "amount must be an integer"}), 400
+    if not pid or not str(pid).isdigit():
+        return jsonify({"error": "product_id is required"}), 400
+    db = get_db()
+    try:
+        reseller = db.query(Reseller).filter(Reseller.id == res_id).first()
+        product = db.query(Product).filter(Product.id == int(pid)).first()
+        if not reseller or not product:
+            return jsonify({"error": "Reseller or product not found"}), 404
+        result = assign_legacy_credits(db, reseller, product, amount)
+        if not result.get("success"):
+            return jsonify({"error": result.get("message")}), 400
+        return jsonify({"success": True, "reseller": reseller.to_dict()})
     finally:
         db.close()
 
@@ -1040,6 +1106,97 @@ def update_system_settings_api():
         if llm_changed:
             invalidate_agent_cache()
         return jsonify(s.to_dict())
+    finally:
+        db.close()
+
+
+# =====================================================================
+# Admin: Bot Tester (live chat with debug info)
+# =====================================================================
+
+@app.route("/api/admin/bot/test", methods=["POST"])
+@require_admin
+def admin_bot_test():
+    """
+    Run one turn of the real bot and return the reply PLUS debug info:
+    engine used, tools called, matched FAQ, elapsed time, and the session state.
+    mode="web" (customer/reseller via chat) or "whatsapp" (identity = phone number).
+    """
+    from database import match_knowledge, credits_summary_text, get_pending_order_for_session
+    data = _payload()
+    message = str(data.get("message", "")).strip()
+    if not message:
+        return jsonify({"error": "message required"}), 400
+    mode = "whatsapp" if data.get("mode") == "whatsapp" else "web"
+    phone = normalize_phone(data.get("phone", "")) if mode == "whatsapp" else ""
+    if mode == "whatsapp" and not re.fullmatch(r"\d{10}", phone):
+        return jsonify({"error": "WhatsApp mode needs a valid 10-digit phone"}), 400
+    session_id = str(data.get("session_id") or "").strip()
+    if not session_id or not session_id.startswith("test_"):
+        session_id = f"test_{mode}_{phone or 'web'}_{int(time.time() * 1000)}"
+
+    t0 = time.time()
+    result = run_deep_agent_chat(
+        session_id=session_id,
+        user_message=message,
+        user_type_hint="customer",
+        platform=mode,
+        owner_id="admin-tester",
+        customer_phone=phone or None,
+        customer_name="Bot Tester" if mode == "whatsapp" else None,
+    )
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    db = get_db()
+    try:
+        rec = db.query(ChatSessionRecord).filter(ChatSessionRecord.id == session_id).first()
+        session = {}
+        if rec:
+            reseller = db.query(Reseller).filter(Reseller.id == rec.reseller_id).first() if rec.reseller_id else None
+            pending = get_pending_order_for_session(db, session_id)
+            session = {
+                "session_id": session_id,
+                "platform": rec.platform,
+                "user_type": rec.user_type,
+                "customer_phone": rec.customer_phone,
+                "reseller": {"name": reseller.name, "phone": reseller.phone, "credits": credits_summary_text(db, reseller)} if reseller else None,
+                "pending_order": {"id": pending.id, "product": pending.product.name if pending.product else None, "amount": pending.total_amount} if pending else None,
+                "last_order_id": rec.last_order_id,
+            }
+        kb = match_knowledge(db, message)
+        kb_match = {"id": kb.id, "question": kb.question, "answer": kb.answer} if kb else None
+    finally:
+        db.close()
+
+    meta = result.get("metadata") or {}
+    return jsonify({
+        "success": result.get("success", False),
+        "session_id": session_id,
+        "reply": result.get("message"),
+        "engine": meta.get("engine"),
+        "tool_calls": meta.get("tool_calls", []),
+        "todos": meta.get("todos", []),
+        "elapsed_ms": elapsed_ms,
+        "kb_match": kb_match,
+        "session": session,
+        "agent": agent_status(),
+    })
+
+
+@app.route("/api/admin/bot/test/reset", methods=["POST"])
+@require_admin
+def admin_bot_test_reset():
+    """Delete a tester session so the next message starts fresh."""
+    session_id = str(_payload().get("session_id") or "").strip()
+    if not session_id.startswith("test_"):
+        return jsonify({"error": "only tester sessions (test_*) can be reset here"}), 400
+    db = get_db()
+    try:
+        rec = db.query(ChatSessionRecord).filter(ChatSessionRecord.id == session_id).first()
+        if rec:
+            db.delete(rec)
+            db.commit()
+        return jsonify({"success": True})
     finally:
         db.close()
 

@@ -76,11 +76,14 @@ def fresh_product(db):
 
 
 @pytest.fixture()
-def fresh_reseller(db):
+def fresh_reseller(db, fresh_product):
+    """A reseller holding 5 credits for `fresh_product` ONLY (credits are per product)."""
     import uuid
     phone = "7" + uuid.uuid4().int.__str__()[:9]
-    reseller = dbm.Reseller(name="Test Reseller", phone=phone, secret_code="4321", credits_balance=5)
+    reseller = dbm.Reseller(name="Test Reseller", phone=phone, secret_code="4321")
     db.add(reseller)
     db.commit()
+    db.refresh(reseller)
+    dbm.adjust_reseller_product_credits(db, reseller, fresh_product, 5, reason="admin_topup", note="test grant")
     db.refresh(reseller)
     return reseller

@@ -40,8 +40,9 @@ def test_reseller_claim_deducts_credits_and_logs(db, fresh_product, fresh_resell
     assert res["remaining_credits"] == 3
     db.refresh(fresh_reseller)
     assert fresh_reseller.credits_balance == 3
-    txns = db.query(dbm.CreditTransaction).filter(dbm.CreditTransaction.reseller_id == fresh_reseller.id).all()
-    assert len(txns) == 2 and all(t.amount == -1 for t in txns)
+    txns = db.query(dbm.CreditTransaction).filter(
+        dbm.CreditTransaction.reseller_id == fresh_reseller.id, dbm.CreditTransaction.reason == "claim_link").all()
+    assert len(txns) == 2 and all(t.amount == -1 and t.product_id == fresh_product.id for t in txns)
 
 
 def test_out_of_stock_rolls_back_credit_deduction(db, fresh_product, fresh_reseller):
@@ -53,11 +54,28 @@ def test_out_of_stock_rolls_back_credit_deduction(db, fresh_product, fresh_resel
 
 
 def test_insufficient_credits_blocks_claim(db, fresh_product, fresh_reseller):
-    fresh_reseller.credits_balance = 1
-    db.commit()
+    dbm.adjust_reseller_product_credits(db, fresh_reseller, fresh_product, -4)  # 5 -> 1
     res = dbm.process_reseller_claim_for(fresh_reseller, fresh_product, 2, db)
     assert not res["success"] and res["error"] == "INSUFFICIENT_CREDITS"
     assert fresh_product.get_available_stock_count(db) == 3
+
+
+def test_credits_are_product_specific(db, fresh_product, fresh_reseller):
+    """Credits for product A must NOT let the reseller claim product B."""
+    import uuid
+    other = dbm.Product(name=f"Other {uuid.uuid4().hex[:6]}", slug=f"other-{uuid.uuid4().hex[:6]}", base_price=50, margin_percent=0)
+    db.add(other); db.commit()
+    db.add(dbm.InviteLink(product_id=other.id, link_or_key="https://example.com/other/1")); db.commit()
+
+    res = dbm.process_reseller_claim_for(fresh_reseller, other, 1, db)   # has 5 credits, but for fresh_product
+    assert not res["success"] and res["error"] == "INSUFFICIENT_CREDITS"
+    assert res["credits_for_product"] == 0
+    assert other.get_available_stock_count(db) == 1                       # nothing burned
+    db.refresh(fresh_reseller)
+    assert fresh_reseller.credits_balance == 5                            # nothing deducted
+
+    ok = dbm.process_reseller_claim_for(fresh_reseller, fresh_product, 1, db)  # the product it DOES have credits for
+    assert ok["success"] and ok["remaining_credits"] == 4
 
 
 def test_quantity_bounds(db, fresh_product, fresh_reseller):

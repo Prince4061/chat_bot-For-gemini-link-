@@ -63,14 +63,22 @@ def test_correct_code_resets_failed_attempts(db, fresh_reseller):
     assert ok and reseller.failed_attempts == 0
 
 
-def test_reseller_validation(client, admin_headers):
+def test_reseller_validation(client, admin_headers, fresh_product):
     assert client.post("/api/admin/resellers", json={"phone": "123", "secret_code": "1234"}, headers=admin_headers).status_code == 400
     assert client.post("/api/admin/resellers", json={"phone": "9000000001", "secret_code": "12"}, headers=admin_headers).status_code == 400
-    r = client.post("/api/admin/resellers", json={"name": "A", "phone": "9000000001", "secret_code": "1234", "credits_balance": 2}, headers=admin_headers)
+    # Initial credits need a product (credits are per product)
+    assert client.post("/api/admin/resellers", json={"name": "A", "phone": "9000000001", "secret_code": "1234", "credits_balance": 2}, headers=admin_headers).status_code == 400
+    r = client.post("/api/admin/resellers", json={"name": "A", "phone": "9000000001", "secret_code": "1234", "credits_balance": 2, "product_id": fresh_product.id}, headers=admin_headers)
     assert r.status_code == 201
+    body = r.get_json()
+    assert body["credits_balance"] == 2 and body["product_credits"][0]["product_id"] == fresh_product.id
     assert client.post("/api/admin/resellers", json={"name": "B", "phone": "9000000001", "secret_code": "1234"}, headers=admin_headers).status_code == 409
-    rid = r.get_json()["id"]
+    rid = body["id"]
+    # product_id required; deducting more than held is rejected
     assert client.post(f"/api/admin/resellers/{rid}/credits", json={"amount": -5}, headers=admin_headers).status_code == 400
+    assert client.post(f"/api/admin/resellers/{rid}/credits", json={"amount": -5, "product_id": fresh_product.id}, headers=admin_headers).status_code == 400
+    ok = client.post(f"/api/admin/resellers/{rid}/credits", json={"amount": 3, "product_id": fresh_product.id}, headers=admin_headers).get_json()
+    assert ok["credits_for_product"] == 5 and ok["new_balance"] == 5
 
 
 def test_bulk_upload_skips_duplicates(client, admin_headers, fresh_product):

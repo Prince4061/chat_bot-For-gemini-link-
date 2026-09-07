@@ -30,6 +30,7 @@ import OrderManager from './OrderManager';
 import SettingsManager from './SettingsManager';
 import EvolutionSimulator from './EvolutionSimulator';
 import KnowledgeManager from './KnowledgeManager';
+import BotTester from './BotTester';
 
 export default function AdminDashboard({ onSwitchToChat, onOpenSidebar }) {
   const [activeTab, setActiveTab] = useState('overview');
@@ -94,6 +95,7 @@ export default function AdminDashboard({ onSwitchToChat, onOpenSidebar }) {
     { id: 'inventory', label: 'Single-Use Links Stock', icon: Layers },
     { id: 'resellers', label: 'Resellers & Passcodes', icon: Users },
     { id: 'orders', label: 'Customer Orders', icon: ShoppingCart },
+    { id: 'tester', label: 'Bot Tester', icon: Bot },
     { id: 'training', label: 'AI Training', icon: Sparkles },
     { id: 'evolution', label: 'WhatsApp Simulator', icon: Smartphone },
     { id: 'settings', label: 'Settings & UPI', icon: Settings },
@@ -394,6 +396,8 @@ export default function AdminDashboard({ onSwitchToChat, onOpenSidebar }) {
 
         {/* Tab 5: Orders */}
         {activeTab === 'orders' && <OrderManager />}
+
+        {activeTab === 'tester' && <BotTester />}
 
         {activeTab === 'training' && <KnowledgeManager />}
 

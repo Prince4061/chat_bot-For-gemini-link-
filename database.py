@@ -35,6 +35,8 @@ from sqlalchemy import (
     ForeignKey,
     Text,
     Index,
+    UniqueConstraint,
+    or_,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -115,8 +117,10 @@ class Product(Base):
             InviteLink.status == "available",
         ).scalar() or 0
 
-    def to_dict(self, session=None) -> Dict[str, Any]:
-        stock = self.get_available_stock_count(session) if session else 0
+    def to_dict(self, session=None, stock: Optional[int] = None) -> Dict[str, Any]:
+        # Pass `stock` (from stock_counts_by_product) when listing many products to avoid N+1 queries.
+        if stock is None:
+            stock = self.get_available_stock_count(session) if session else 0
         return {
             "id": self.id,
             "name": self.name,
@@ -182,7 +186,11 @@ class Reseller(Base):
     name = Column(String(100), nullable=False)
     phone = Column(String(30), unique=True, index=True, nullable=False)
     secret_code = Column(String(10), nullable=False)   # 4-digit passcode
+    # TOTAL of per-product credits (kept in sync; display only). Claims use ResellerCredit rows.
     credits_balance = Column(Integer, default=0, nullable=False)
+    # Old generic wallet credits that were never tied to a product. Not claimable until the
+    # admin assigns them to a product (see assign_legacy_credits).
+    legacy_unassigned_credits = Column(Integer, default=0, nullable=False)
     is_active = Column(Boolean, default=True)
     notes = Column(Text, nullable=True)
     # Brute-force protection
@@ -193,6 +201,7 @@ class Reseller(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     transactions = relationship("CreditTransaction", back_populates="reseller", cascade="all, delete-orphan")
+    product_credits = relationship("ResellerCredit", back_populates="reseller", cascade="all, delete-orphan")
 
     def is_locked(self) -> bool:
         return bool(self.locked_until and self.locked_until > utcnow())
@@ -203,6 +212,16 @@ class Reseller(Base):
             "name": self.name,
             "phone": self.phone,
             "credits_balance": self.credits_balance,
+            "legacy_unassigned_credits": self.legacy_unassigned_credits or 0,
+            "product_credits": [
+                {
+                    "product_id": pc.product_id,
+                    "product_name": pc.product.name if pc.product else f"#{pc.product_id}",
+                    "slug": pc.product.slug if pc.product else None,
+                    "credits": pc.credits,
+                }
+                for pc in sorted(self.product_credits, key=lambda x: x.product_id)
+            ],
             "is_active": self.is_active,
             "is_locked": self.is_locked(),
             "failed_attempts": self.failed_attempts or 0,
@@ -215,6 +234,25 @@ class Reseller(Base):
         if include_secret:
             data["secret_code"] = self.secret_code
         return data
+
+
+class ResellerCredit(Base):
+    """
+    Per-product credit wallet. Credits given for Gemini can ONLY claim Gemini links.
+    This is the source of truth for what a reseller may claim; Reseller.credits_balance
+    is just the synced total for display.
+    """
+    __tablename__ = "reseller_credits"
+    __table_args__ = (UniqueConstraint("reseller_id", "product_id", name="uq_reseller_product_credit"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    reseller_id = Column(Integer, ForeignKey("resellers.id"), nullable=False, index=True)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
+    credits = Column(Integer, default=0, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+    reseller = relationship("Reseller", back_populates="product_credits")
+    product = relationship("Product")
 
 
 class CreditTransaction(Base):
@@ -534,8 +572,32 @@ def match_knowledge(db, message: str) -> Optional["KnowledgeEntry"]:
     return best if best_score >= 1 else None
 
 
+def stock_counts_by_product(db, product_ids: Optional[List[int]] = None) -> Dict[int, int]:
+    """One GROUP BY query for available stock -> {product_id: count}. Use for lists/metrics."""
+    q = db.query(InviteLink.product_id, func.count(InviteLink.id)).filter(InviteLink.status == "available")
+    if product_ids is not None:
+        if not product_ids:
+            return {}
+        q = q.filter(InviteLink.product_id.in_(product_ids))
+    return {pid: int(n) for pid, n in q.group_by(InviteLink.product_id).all()}
+
+
+# Words that carry no product identity in a chat message (kept out of the SQL pre-filter).
+_QUERY_NOISE = _STOPWORDS | {
+    "link", "links", "chahiye", "chaiye", "price", "rate", "cost", "kitne", "kitna", "dikhao",
+    "batao", "bhejo", "claim", "order", "buy", "want", "need", "give", "send", "please", "bhai",
+    "mujhe", "muje", "mera", "meri", "hai", "hain", "kya", "kaise", "ka", "ki", "ke", "do", "de",
+}
+
+
 def find_product(db, name_or_slug_or_id: Any, active_only: bool = True) -> Optional[Product]:
-    """Resolve a product by id, exact slug, or fuzzy name/slug match (best match first)."""
+    """
+    Resolve a product by id, exact slug, direct name/slug substring, or free text.
+    Scales to very large catalogues: free-text matching pre-filters candidates in SQL by the
+    message's significant words, then ranks them by (distinctive-token hits, all-token hits,
+    shorter name). Tier words like "Team"/"Enterprise" and numbers act as tie-breakers, so
+    "notion team" picks a Notion *Team* plan and "00302" picks the exact variant.
+    """
     if name_or_slug_or_id is None:
         return None
     q = db.query(Product)
@@ -543,6 +605,8 @@ def find_product(db, name_or_slug_or_id: Any, active_only: bool = True) -> Optio
         q = q.filter(Product.is_active == True)  # noqa: E712
 
     raw = str(name_or_slug_or_id).strip()
+    if not raw:
+        return None
     if raw.isdigit():
         return q.filter(Product.id == int(raw)).first()
 
@@ -551,23 +615,34 @@ def find_product(db, name_or_slug_or_id: Any, active_only: bool = True) -> Optio
         return exact
 
     like = f"%{raw}%"
-    candidates = q.filter((Product.slug.ilike(like)) | (Product.name.ilike(like))).all()
+    candidates = q.filter((Product.slug.ilike(like)) | (Product.name.ilike(like))).limit(50).all()
     if candidates:
         # Prefer the shortest name: "Claude Pro" beats "Claude Pro Team Bundle" for "claude".
         return sorted(candidates, key=lambda p: len(p.name))[0]
 
-    # Free-text fallback ("claude ki link do"): score products by how many of their
-    # *distinctive* name/slug tokens appear in the text. Generic words such as
-    # "link", "invite" or "pro" are ignored so they can't pull in the wrong product.
     text_tokens = set(re.findall(r"[a-z0-9]+", raw.lower()))
-    best, best_score = None, 0
-    for p in q.all():
+    # SQL pre-filter: only products whose name/slug contains at least one significant word.
+    sig = [t for t in text_tokens if len(t) >= 3 and t not in _QUERY_NOISE]
+    if not sig:
+        return None
+    conds = []
+    for t in sig[:8]:
+        conds.append(Product.name.ilike(f"%{t}%"))
+        conds.append(Product.slug.ilike(f"%{t}%"))
+    cands = q.filter(or_(*conds)).limit(3000).all()
+
+    best, best_key = None, None
+    for p in cands:
         tokens = set(re.findall(r"[a-z0-9]+", f"{p.name} {p.slug}".lower()))
         distinctive = {t for t in tokens if len(t) >= 4 and t not in _GENERIC_PRODUCT_WORDS}
-        score = len(distinctive & text_tokens)
-        if score > best_score or (score == best_score and score and len(p.name) < len(best.name)):
-            best, best_score = p, score
-    return best if best_score > 0 else None
+        primary = len(distinctive & text_tokens)          # brand / model / number words
+        if primary == 0:
+            continue
+        secondary = len(tokens & text_tokens)             # + tier words (team, premium, ...)
+        key = (primary, secondary, -len(p.name))
+        if best_key is None or key > best_key:
+            best, best_key = p, key
+    return best
 
 
 _GENERIC_PRODUCT_WORDS = {
@@ -598,6 +673,88 @@ def find_reseller_by_phone(db, phone: str) -> Optional[Reseller]:
     return db.query(Reseller).filter(
         (Reseller.phone == norm) | (Reseller.phone == f"+91{norm}") | (Reseller.phone == f"91{norm}")
     ).first()
+
+
+# ---------------------------------------------------------------------
+# Per-product credits (the ONLY thing a reseller can claim against)
+# ---------------------------------------------------------------------
+
+def get_reseller_product_credits(db, reseller: Reseller) -> List[Dict[str, Any]]:
+    rows = db.query(ResellerCredit).filter(ResellerCredit.reseller_id == reseller.id).all()
+    out = []
+    for rc in rows:
+        p = rc.product
+        out.append({
+            "product_id": rc.product_id,
+            "product_name": p.name if p else f"#{rc.product_id}",
+            "slug": p.slug if p else None,
+            "credits": rc.credits,
+        })
+    return sorted(out, key=lambda x: x["product_id"])
+
+
+def get_reseller_credit_for_product(db, reseller_id: int, product_id: int) -> int:
+    rc = db.query(ResellerCredit).filter_by(reseller_id=reseller_id, product_id=product_id).first()
+    return int(rc.credits) if rc else 0
+
+
+def credits_summary_text(db, reseller: Reseller) -> str:
+    """Human line like 'Gemini Advanced: 5, Claude Pro: 2' (only products with credits)."""
+    items = [
+        f"{c['product_name'].split(' (')[0]}: {c['credits']}"
+        for c in get_reseller_product_credits(db, reseller) if c["credits"] > 0
+    ]
+    return ", ".join(items) if items else "koi credits nahi"
+
+
+def sync_reseller_total(db, reseller: Reseller) -> int:
+    """Keep Reseller.credits_balance == sum of per-product credits (display only)."""
+    db.flush()  # session has autoflush=False: push pending credit changes before summing
+    total = db.query(func.coalesce(func.sum(ResellerCredit.credits), 0)).filter(
+        ResellerCredit.reseller_id == reseller.id
+    ).scalar() or 0
+    reseller.credits_balance = int(total)
+    reseller.updated_at = utcnow()
+    return int(total)
+
+
+def adjust_reseller_product_credits(db, reseller: Reseller, product: Product, amount: int,
+                                    reason: str = "admin_topup", note: str = "") -> Dict[str, Any]:
+    """Add (+) or deduct (-) credits for ONE product. Never lets a product go negative."""
+    amount = int(amount)
+    if amount == 0:
+        return {"success": False, "error": "INVALID_AMOUNT", "message": "Amount cannot be zero."}
+    rc = db.query(ResellerCredit).filter_by(reseller_id=reseller.id, product_id=product.id).first()
+    if not rc:
+        rc = ResellerCredit(reseller_id=reseller.id, product_id=product.id, credits=0)
+        db.add(rc)
+        db.flush()
+    if rc.credits + amount < 0:
+        return {"success": False, "error": "INSUFFICIENT",
+                "message": f"Cannot deduct {abs(amount)}: only {rc.credits} credit(s) for {product.name}."}
+    rc.credits += amount
+    rc.updated_at = utcnow()
+    total = sync_reseller_total(db, reseller)
+    db.add(CreditTransaction(
+        reseller_id=reseller.id, amount=amount, balance_after=rc.credits, reason=reason,
+        product_id=product.id,
+        reference_note=note or f"{'Added' if amount > 0 else 'Deducted'} {abs(amount)} credit(s) for {product.name}",
+    ))
+    db.commit()
+    db.refresh(reseller)
+    return {"success": True, "product_id": product.id, "product_name": product.name, "change": amount,
+            "credits_for_product": rc.credits, "total_credits": total}
+
+
+def assign_legacy_credits(db, reseller: Reseller, product: Product, amount: int) -> Dict[str, Any]:
+    """Move old un-tied wallet credits onto a specific product so they become claimable."""
+    amount = int(amount)
+    legacy = reseller.legacy_unassigned_credits or 0
+    if amount <= 0 or amount > legacy:
+        return {"success": False, "error": "INVALID_AMOUNT", "message": f"Choose between 1 and {legacy} legacy credit(s)."}
+    reseller.legacy_unassigned_credits = legacy - amount
+    return adjust_reseller_product_credits(db, reseller, product, amount, reason="legacy_assign",
+                                           note=f"Assigned {amount} legacy credit(s) to {product.name}")
 
 
 def verify_reseller_auth(phone: str, secret_code: str, db=None) -> Tuple[bool, Optional[Reseller], str]:
@@ -788,28 +945,34 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
 
     try:
         with _CLAIM_LOCK:
-            # 1. Guarded credit deduction - fails atomically if balance is too low.
+            # 1. Guarded PER-PRODUCT credit deduction. Credits for other products don't count:
+            #    a reseller with Gemini credits cannot claim Claude links.
+            if not reseller.is_active:
+                return {"success": False, "error": "AUTH_FAILED", "message": "Reseller account is inactive."}
             result = db.execute(
-                update(Reseller)
+                update(ResellerCredit)
                 .where(
-                    Reseller.id == reseller.id,
-                    Reseller.is_active == True,  # noqa: E712
-                    Reseller.credits_balance >= total_credits_needed,
+                    ResellerCredit.reseller_id == reseller.id,
+                    ResellerCredit.product_id == product.id,
+                    ResellerCredit.credits >= total_credits_needed,
                 )
-                .values(credits_balance=Reseller.credits_balance - total_credits_needed, updated_at=utcnow())
+                .values(credits=ResellerCredit.credits - total_credits_needed, updated_at=utcnow())
             )
             if result.rowcount != 1:
                 db.rollback()
-                db.refresh(reseller)
+                have = get_reseller_credit_for_product(db, reseller.id, product.id)
+                summary = credits_summary_text(db, reseller)
                 return {
                     "success": False,
                     "error": "INSUFFICIENT_CREDITS",
                     "message": (
-                        f"Insufficient credits. You have {reseller.credits_balance} credit(s), but "
-                        f"{total_credits_needed} are required ({product.credit_cost} x {quantity})."
+                        f"Aapke paas {product.name} ke liye {have} credit(s) hain, "
+                        f"lekin {total_credits_needed} chahiye ({product.credit_cost} x {quantity}). "
+                        f"Aapke credits: {summary}. Is product ke credits ke liye admin se baat karein."
                     ),
-                    "credits_balance": reseller.credits_balance,
+                    "credits_for_product": have,
                     "credits_required": total_credits_needed,
+                    "credits_by_product": get_reseller_product_credits(db, reseller),
                 }
 
             # 2. Burn links.
@@ -825,29 +988,32 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
                     "available_stock": available,
                 }
 
-            # 3. Audit trail.
-            db.refresh(reseller)
-            balance_after = reseller.credits_balance
+            # 3. Audit trail + keep the display total in sync.
+            remaining_for_product = get_reseller_credit_for_product(db, reseller.id, product.id)
+            sync_reseller_total(db, reseller)
             for link in links:
                 db.add(CreditTransaction(
                     reseller_id=reseller.id,
                     amount=-product.credit_cost,
-                    balance_after=balance_after,
+                    balance_after=remaining_for_product,
                     reason="claim_link",
                     product_id=product.id,
                     link_id=link.id,
                     reference_note=f"Redeemed 1 single-use link for {product.name} ({order_ref})",
                 ))
             db.commit()
+            db.refresh(reseller)
 
-        logger.info("Reseller %s claimed %d x %s (balance now %d)", reseller.phone, quantity, product.slug, balance_after)
+        logger.info("Reseller %s claimed %d x %s (%s credits left for it)", reseller.phone, quantity, product.slug, remaining_for_product)
         return {
             "success": True,
             "message": f"Successfully claimed {quantity} link(s) for {product.name}!",
             "product_name": product.name,
             "quantity": quantity,
             "credits_deducted": total_credits_needed,
-            "remaining_credits": balance_after,
+            "remaining_credits": remaining_for_product,          # for THIS product
+            "remaining_total_credits": reseller.credits_balance,  # across all products
+            "credits_by_product": get_reseller_product_credits(db, reseller),
             "links": [l.link_or_key for l in links],
             "links_claimed_ids": [l.id for l in links],
             "reseller_name": reseller.name,
@@ -1005,6 +1171,24 @@ def _ensure_columns() -> None:
             index.create(bind=engine, checkfirst=True)
 
 
+def _migrate_legacy_credits(db) -> None:
+    """
+    Older databases had one generic wallet per reseller. Credits are now per product, so
+    any generic balance with no per-product rows is parked as 'legacy_unassigned_credits'
+    for the admin to assign to a product. Idempotent (balance is zeroed after the move).
+    """
+    moved = 0
+    for r in db.query(Reseller).all():
+        has_rows = db.query(ResellerCredit.id).filter_by(reseller_id=r.id).first() is not None
+        if not has_rows and (r.credits_balance or 0) > 0:
+            r.legacy_unassigned_credits = (r.legacy_unassigned_credits or 0) + r.credits_balance
+            r.credits_balance = 0
+            moved += 1
+    if moved:
+        db.commit()
+        logger.info("Migrated generic wallet credits to 'unassigned' for %d reseller(s) - assign them to products in Admin.", moved)
+
+
 def init_db() -> None:
     """Create tables, apply light migrations, seed demo data on first run."""
     Base.metadata.create_all(bind=engine)
@@ -1014,6 +1198,7 @@ def init_db() -> None:
         if db.query(Product).count() == 0:
             seed_data(db)
             logger.info("Seeded demo products, links and resellers.")
+        _migrate_legacy_credits(db)
     finally:
         db.close()
 
@@ -1077,16 +1262,15 @@ def seed_data(db) -> None:
         db.add(InviteLink(product_id=pid, link_or_key=lk, status="available"))
 
     resellers = [
-        Reseller(name="Rahul Sharma (Verified Reseller)", phone="9876543210", secret_code="1234", credits_balance=25, notes="Top Tier Reseller - Delhi Region"),
-        Reseller(name="Amit Patel (Reseller Pro)", phone="9123456780", secret_code="8899", credits_balance=10, notes="Mumbai Reseller Partner"),
-        Reseller(name="Pooja Verma (Tech Store)", phone="9988776655", secret_code="4321", credits_balance=3, notes="New Reseller Account"),
+        Reseller(name="Rahul Sharma (Verified Reseller)", phone="9876543210", secret_code="1234", notes="Top Tier Reseller - Delhi Region"),
+        Reseller(name="Amit Patel (Reseller Pro)", phone="9123456780", secret_code="8899", notes="Mumbai Reseller Partner"),
+        Reseller(name="Pooja Verma (Tech Store)", phone="9988776655", secret_code="4321", notes="New Reseller Account"),
     ]
     db.add_all(resellers)
     db.commit()
 
-    for r in resellers:
-        db.add(CreditTransaction(
-            reseller_id=r.id, amount=r.credits_balance, balance_after=r.credits_balance,
-            reason="admin_topup", reference_note="Initial account onboarding credits",
-        ))
-    db.commit()
+    # Credits are PER PRODUCT: Rahul can claim Gemini + Claude, Amit only ChatGPT, Pooja only Canva.
+    r1, r2, r3 = resellers
+    for reseller, product, credits in ((r1, p1, 15), (r1, p2, 10), (r2, p3, 10), (r3, p4, 3)):
+        adjust_reseller_product_credits(db, reseller, product, credits, reason="admin_topup",
+                                        note="Initial account onboarding credits")

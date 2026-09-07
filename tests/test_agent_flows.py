@@ -129,6 +129,29 @@ def test_whatsapp_clears_stale_reseller_link_for_unregistered_number(db, fresh_r
     assert fresh_reseller.name not in out["message"]
 
 
+def test_whatsapp_registered_reseller_hi_shows_name_and_credits(db, fresh_product, fresh_reseller):
+    """A registered number saying just 'hi' gets name + per-product credits — no need to ask."""
+    from agent_core import run_deep_agent_chat
+    sid = f"wa_hi_{fresh_reseller.phone}"
+    out = run_deep_agent_chat(sid, "hi", platform="whatsapp",
+                              owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    msg = out["message"]
+    assert fresh_reseller.name.split()[0] in msg                      # greeted by first name ("Hello Test sir")
+    assert "balance" in msg.lower() and "link chahiye" in msg.lower()
+    assert fresh_product.name.split(" (")[0] in msg and "5" in msg   # its product + credit count
+
+
+def test_whatsapp_customer_hi_asks_which_product_and_lists_catalogue(db):
+    """Unregistered WhatsApp number = customer: 'hi' -> ask which product + products from admin DB.
+    Must NOT ask 'customer ya reseller', and must not mention passcodes."""
+    from agent_core import run_deep_agent_chat
+    out = run_deep_agent_chat("wa_5550002222", "hi", platform="whatsapp",
+                              owner_id="wa:5550002222", customer_phone="5550002222")["message"]
+    assert "kaunsa product" in out.lower()
+    assert "Gemini Advanced" in out and "₹" in out          # live catalogue from the DB
+    assert "Reseller?" not in out and "passcode" not in out.lower()
+
+
 def test_whatsapp_unregistered_number_gets_contact_guidance(db):
     from agent_core import run_deep_agent_chat
     s = dbm.get_settings(db); s.admin_contact_number = "+919000000123"; db.commit()

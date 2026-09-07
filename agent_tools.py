@@ -7,6 +7,7 @@ back to the WhatsApp sender's phone number - none of which the LLM has to pass i
 All tools return JSON strings so results are unambiguous for the model.
 """
 import json
+import re
 import logging
 from typing import Optional
 
@@ -25,6 +26,8 @@ from database import (
     find_product,
     generate_order_id,
     verify_reseller_auth,
+    get_reseller_product_credits,
+    credits_summary_text,
     process_reseller_claim_for,
     fulfill_order,
     get_pending_order_for_session,
@@ -72,17 +75,35 @@ def _remember_reseller(db, reseller: Reseller) -> None:
 # =====================================================================
 
 @tool
-def get_live_product_catalog(user_role: str = "customer") -> str:
+def get_live_product_catalog(user_role: str = "customer", search: str = "") -> str:
     """
-    Fetch the live catalogue of digital products with real-time dynamic pricing and stock.
+    Fetch the live catalogue with real-time pricing and stock. The catalogue can be very large,
+    so at most 25 products are returned: pass `search` (brand or product words, e.g. "notion team",
+    "canva") to narrow it down, and use get_product_pricing for one exact product.
     Customers see the selling price (base + admin margin %); resellers see the credit cost per link.
     """
+    from sqlalchemy import or_
+    from database import stock_counts_by_product
     db = get_db()
     try:
-        products = db.query(Product).filter(Product.is_active == True).order_by(Product.id).all()  # noqa: E712
+        LIMIT = 25
+        base_q = db.query(Product).filter(Product.is_active == True)  # noqa: E712
+        total = base_q.count()
+        terms = [t for t in re.findall(r"[a-z0-9]+", (search or "").lower()) if len(t) >= 2][:6]
+        q = base_q
+        if terms:
+            # "figma premium" -> products matching ALL words; fall back to ANY word if nothing matches.
+            q = base_q
+            for t in terms:
+                q = q.filter(Product.name.ilike(f"%{t}%"))
+            if q.count() == 0:
+                q = base_q.filter(or_(*[Product.name.ilike(f"%{t}%") for t in terms]))
+        matched = q.count()
+        products = q.order_by(Product.id).limit(LIMIT).all()
+        stock_map = stock_counts_by_product(db, [p.id for p in products])
         catalog = []
         for p in products:
-            stock = p.get_available_stock_count(db)
+            stock = stock_map.get(p.id, 0)
             catalog.append({
                 "id": p.id,
                 "name": p.name,
@@ -94,8 +115,14 @@ def get_live_product_catalog(user_role: str = "customer") -> str:
                 "in_stock": stock > 0,
                 "available_stock": stock,
             })
-        record_tool_call("get_live_product_catalog", True, f"{len(catalog)} products")
-        return _json({"status": "success", "user_role": user_role, "total_products": len(catalog), "catalog": catalog})
+        record_tool_call("get_live_product_catalog", True, f"{len(catalog)}/{matched} products")
+        note = None
+        if matched > len(catalog):
+            note = (f"Showing {len(catalog)} of {matched} matching products (catalogue has {total} total). "
+                    "Ask the user for a brand/product name and call again with `search`, or use get_product_pricing.")
+        return _json({"status": "success", "user_role": user_role, "total_products": total,
+                      "matched": matched, "shown": len(catalog), "search": search or None,
+                      "note": note, "catalog": catalog})
     finally:
         db.close()
 
@@ -158,7 +185,10 @@ def verify_reseller_credentials(phone: str, secret_code: str) -> str:
             "reseller_name": reseller.name,
             "phone": reseller.phone,
             "credits_balance": reseller.credits_balance,
-            "message": f"Welcome back {reseller.name}! You have {reseller.credits_balance} credit(s). Verified for this session.",
+            "credits_by_product": get_reseller_product_credits(db, reseller),
+            "credits_summary": credits_summary_text(db, reseller),
+            "note": "Credits are PER PRODUCT - the reseller can only claim products they have credits for.",
+            "message": f"Welcome back {reseller.name}! Credits: {credits_summary_text(db, reseller)}. Verified for this session.",
         })
     finally:
         db.close()
@@ -191,7 +221,9 @@ def check_reseller_credits(phone: str = "", secret_code: str = "") -> str:
             "reseller_name": reseller.name,
             "phone": reseller.phone,
             "credits_balance": reseller.credits_balance,
-            "rate_info": "1 Credit = 1 single-use invite link",
+            "credits_by_product": get_reseller_product_credits(db, reseller),
+            "credits_summary": credits_summary_text(db, reseller),
+            "rate_info": "1 Credit = 1 single-use link of THAT product only (credits are per product)",
         })
     finally:
         db.close()

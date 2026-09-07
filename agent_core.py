@@ -10,6 +10,7 @@ Responsibilities
 """
 import json
 import re
+from sqlalchemy import or_
 import logging
 import threading
 import datetime
@@ -24,7 +25,7 @@ from config import Config
 from deep_agents import create_deep_agent, DeepAgentError, extract_text
 from deep_agents.backends import FileSystemBackend
 from agent_tools import ALL_AGENT_TOOLS
-from agent_context import SessionContext, set_session_context, reset_session_context
+from agent_context import SessionContext, set_session_context, reset_session_context, record_tool_call
 from database import (
     get_db,
     get_settings,
@@ -40,6 +41,9 @@ from database import (
     find_reseller_by_phone,
     get_active_knowledge,
     match_knowledge,
+    credits_summary_text,
+    get_reseller_product_credits,
+    stock_counts_by_product,
     process_reseller_claim_for,
     fulfill_order,
     get_pending_order_for_session,
@@ -271,20 +275,30 @@ def build_session_context_text(db, session_rec: ChatSessionRecord) -> str:
         reseller = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
     if reseller and reseller.is_active and not reseller.is_locked():
         how = "auto-verified by their WhatsApp number" if is_whatsapp else "verified in this conversation"
+        summary = credits_summary_text(db, reseller)
         lines.append(
-            f"- RESELLER VERIFIED ({how}): {reseller.name} (phone {reseller.phone}), "
-            f"wallet balance {reseller.credits_balance} credit(s). Do NOT ask for phone or passcode; "
-            "call check_reseller_credits() or claim_reseller_product_link(product_name, quantity) directly."
+            f"- RESELLER VERIFIED ({how}): {reseller.name} (phone {reseller.phone}). "
+            f"Credits are PER PRODUCT — they currently have: {summary}. They can ONLY claim products "
+            "they hold credits for (Gemini credits cannot claim Claude, etc.). Do NOT ask for phone or "
+            "passcode; call claim_reseller_product_link(product_name, quantity) or check_reseller_credits() directly."
         )
+        if is_whatsapp:
+            lines.append(
+                "- On WhatsApp, when this reseller greets or sends a general message, reply IMMEDIATELY with "
+                f"their name and their per-product credits (\"{summary}\") and ask which product's link "
+                "they want — do NOT wait for them to ask for their balance."
+            )
     elif is_whatsapp:
         # On WhatsApp the sender's number is known and is NOT a registered reseller.
         contact_line = (f"Tell them to contact {contact} to pay and get reseller access."
                         if contact else "Tell them to contact the admin to pay and get reseller access.")
         lines.append(
-            "- This WhatsApp number is NOT a registered reseller. Do NOT greet them by any reseller "
-            "name and do NOT show any credit balance or claim any link for them - they have no reseller "
-            "account. Never ask them for a phone number (you already have it) or a passcode. They can "
-            f"buy as a normal customer via UPI. If they want reseller credits/links: {contact_line}"
+            "- This WhatsApp number is NOT a registered reseller, so treat them as a CUSTOMER. On a greeting "
+            "or general message, reply like: 'Namaste! Aapko kaunsa product chahiye?' and show the live "
+            "catalogue (call get_live_product_catalog). NEVER ask 'customer ya reseller' on WhatsApp. "
+            "Do NOT greet them by any reseller name, show any credit balance, or claim any link for them. "
+            "Never ask them for a phone number (you already have it) or a passcode. They buy via UPI. "
+            f"If they ask for reseller credits/links: {contact_line}"
         )
     else:
         lines.append("- Reseller: NOT verified. On web, links are claimed only after phone + 4-digit passcode verification.")
@@ -517,14 +531,20 @@ def _fmt_links(links: List[str]) -> str:
     return "\n".join(f"`{l}`" for l in links)
 
 
+def _credits_lines(res_by_product: List[Dict[str, Any]]) -> str:
+    items = [f"• {c['product_name'].split(' (')[0]}: **{c['credits']}**" for c in res_by_product if c.get("credits", 0) > 0]
+    return "\n".join(items) if items else "• koi credits nahi"
+
+
 def _reseller_claim_reply(res: Dict[str, Any]) -> str:
     if not res.get("success"):
         return f"❌ **Reseller operation failed:** {res.get('message')}"
+    short = res['product_name'].split(' (')[0]
     return (
         "🎉 **Link Claimed & Burned:**\n\n"
         f"👤 Reseller: **{res['reseller_name']}**\n"
         f"📦 Product: **{res['product_name']}** × {res['quantity']}\n"
-        f"💳 Credits deducted: **{res['credits_deducted']}** | Remaining: **{res['remaining_credits']}**\n\n"
+        f"💳 Credits deducted: **{res['credits_deducted']}** | {short} credits left: **{res['remaining_credits']}**\n\n"
         f"🔗 **Your Single-Use Invite Link(s):**\n{_fmt_links(res['links'])}\n\n"
         "⚠️ *Each link is permanently burned from stock and reserved for you alone.*"
     )
@@ -578,17 +598,27 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             return _reseller_claim_reply(process_reseller_claim_for(reseller, product, quantity, db))
         return (
             "✅ **Reseller verified!**\n\n"
-            f"👤 Name: **{reseller.name}**\n📱 Phone: **{reseller.phone}**\n💳 Wallet: **{reseller.credits_balance} credit(s)**\n\n"
-            "Reply with the product you want (e.g. *'Gemini ki link do'* or *'Claim Claude Pro'*)."
+            f"👤 Name: **{reseller.name}**\n📱 Phone: **{reseller.phone}**\n"
+            f"💳 Aapke credits (per product):\n{_credits_lines(get_reseller_product_credits(db, reseller))}\n\n"
+            "Reply with the product you want (e.g. *'Gemini ki link do'*). Sirf un products ki link milegi jinke credits hain."
         )
 
-    # 2. Already-verified reseller naming a product
+    # 2. Already-verified reseller (web-verified or WhatsApp auto-verified by number)
     if session_rec.reseller_id:
         reseller = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
         if reseller and reseller.is_active:
-            if any(k in msg for k in ("balance", "credit", "wallet")) and not find_product(db, user_message):
-                return f"💳 **{reseller.name}**, your wallet balance is **{reseller.credits_balance} credit(s)**."
             product = find_product(db, user_message)
+            asks_balance = any(k in msg for k in ("balance", "credit", "wallet"))
+            is_greeting = bool(re.fullmatch(r"\W*(hi+|hello+|hey+|hii+|namaste|namaskar|start|menu|help|yo|ok|hlo)\W*", msg)) or len(msg) <= 2
+            # Registered reseller says "hi" (or asks balance) -> show name + per-product credits
+            # right away, no need to ask. This is the WhatsApp "number = identity" experience.
+            if (asks_balance or is_greeting) and not product:
+                first_name = reseller.name.split(" (")[0].split()[0] if reseller.name else "Reseller"
+                return (
+                    f"👋 Hello **{first_name}** sir! Aapke paas ye balance hai:\n"
+                    f"{_credits_lines(get_reseller_product_credits(db, reseller))}\n\n"
+                    "Kya aapko koi link chahiye? Bas product ka naam bhejo (jaise *'Gemini ki link do'*)."
+                )
             if product and not any(k in msg for k in _CATALOG_KEYWORDS):
                 return _reseller_claim_reply(process_reseller_claim_for(reseller, product, quantity, db))
 
@@ -605,13 +635,36 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
                 f"• {named.description}\n\n"
                 f"Reply *'buy {named.name.split(' (')[0]}'* to order, or send your reseller phone + 4-digit code to claim."
             )
-        products = db.query(Product).filter(Product.is_active == True).order_by(Product.id).all()  # noqa: E712
-        out = "🛍️ **Available Digital Products & Live Rates:**\n\n"
+        # Large catalogues: never dump everything. Optional search term narrows the list,
+        # otherwise show the first page and tell the user how to search.
+        CATALOG_PAGE = 20
+        base_q = db.query(Product).filter(Product.is_active == True)  # noqa: E712
+        total = base_q.count()
+        term_tokens = [t for t in re.findall(r"[a-z0-9]+", msg) if len(t) >= 3 and t not in _CATALOG_KEYWORDS and t not in ("products", "product", "sab", "all", "menu", "list", "catalog", "catalogue", "dikhao", "batao", "kya", "hai", "hain", "aur", "the", "mujhe", "bhai", "koi", "kon", "kaun", "sa", "se", "kya")]
+        search_q = base_q
+        if term_tokens:
+            # ALL words first ("figma premium" -> Figma Premium only), then ANY word, then full list.
+            search_q = base_q
+            for t in term_tokens[:5]:
+                search_q = search_q.filter(Product.name.ilike(f"%{t}%"))
+            if search_q.count() == 0:
+                search_q = base_q.filter(or_(*[Product.name.ilike(f"%{t}%") for t in term_tokens[:5]]))
+            if search_q.count() == 0:
+                search_q = base_q
+                term_tokens = []
+        shown_total = search_q.count()
+        products = search_q.order_by(Product.id).limit(CATALOG_PAGE).all()
+        stock_map = stock_counts_by_product(db, [p.id for p in products])
+
+        title = f"🛍️ **Products matching '{' '.join(term_tokens)}'** ({shown_total})" if term_tokens else f"🛍️ **Available Digital Products & Live Rates** ({total} products)"
+        out = title + "\n\n"
         for p in products:
-            stock = p.get_available_stock_count(db)
-            badge = f"✅ In stock ({stock})" if stock > 0 else "❌ Out of stock"
-            out += f"• **{p.name}**\n  - Customer price: **₹{p.get_customer_price():,.2f}**\n  - Reseller cost: **{p.credit_cost} credit**\n  - {badge}\n\n"
-        out += "💡 *Customers: reply with the product name to order. Resellers: send your registered phone + 4-digit code.*"
+            stock = stock_map.get(p.id, 0)
+            badge = f"✅ {stock} in stock" if stock > 0 else "❌ Out of stock"
+            out += f"• **{p.name}** — ₹{p.get_customer_price():,.2f} · {p.credit_cost} credit · {badge}\n"
+        if shown_total > len(products):
+            out += f"\n…aur {shown_total - len(products)} products hain. Brand/naam bhejo (jaise *'notion'*, *'canva pro'*) to exact product dikhaunga.\n"
+        out += "\n💡 *Kharidne ke liye product ka naam bhejo. Reseller: bas product ka naam bhejo, credits se link milegi.*"
         return out
 
     # 4. Payment reference for this conversation's pending order
@@ -668,15 +721,23 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
     #     didn't handle — refund/delivery/how-to-pay/etc., trained from the admin panel).
     kb = match_knowledge(db, user_message)
     if kb:
+        record_tool_call("knowledge_base", True, f"#{kb.id} {kb.question}")  # visible in Bot Tester / metadata
         return kb.answer
 
     # 6. Greeting / help (platform-aware)
     if is_whatsapp:
+        # Unregistered WhatsApp number = customer. Never ask "customer ya reseller" — just ask
+        # which product they want and show the live catalogue from the admin panel.
+        top = db.query(Product).filter(Product.is_active == True).order_by(Product.id).limit(8).all()  # noqa: E712
+        total = db.query(Product).filter(Product.is_active == True).count()  # noqa: E712
+        stock_map = stock_counts_by_product(db, [p.id for p in top])
+        lines = [f"• {p.name.split(' (')[0]} — ₹{p.get_customer_price():,.0f}" + ("" if stock_map.get(p.id, 0) else " (out of stock)") for p in top]
+        more = f"\n…aur {total - len(top)} products. Naam bhejo to details dunga." if total > len(top) else ""
         return (
-            f"👋 **Welcome to {settings.business_name}!**\n\n"
-            "Product ka naam bhejo live price + kharidne ke liye (UPI se pay).\n\n"
-            "🔑 Agar aap registered reseller ho to aapke credits is number se apne aap kaam karte hain — "
-            "bas *'balance'* ya product ka naam bhejo."
+            f"👋 Namaste! **{settings.business_name}** me swagat hai.\n\n"
+            "Sir, aapko **kaunsa product** chahiye?\n\n"
+            + "\n".join(lines) + more +
+            "\n\nBas product ka naam bhejo — price, UPI payment aur link turant milega."
         )
     return (
         f"👋 **Welcome to {settings.business_name}!**\n\n"

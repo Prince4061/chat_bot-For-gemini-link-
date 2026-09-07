@@ -25,16 +25,20 @@ export default function ResellerManager() {
   const [transactions, setTransactions] = useState([]);
   const [showCodes, setShowCodes] = useState({});
 
-  // Credit Adjustment State
+  // Credit Adjustment State (credits are PER PRODUCT)
+  const [products, setProducts] = useState([]);
+  const [creditProductId, setCreditProductId] = useState('');
   const [creditAmount, setCreditAmount] = useState(10);
   const [creditReason, setCreditReason] = useState('admin_topup');
   const [creditNote, setCreditNote] = useState('Admin wallet topup');
+  const [legacyMode, setLegacyMode] = useState(false); // assigning old unassigned credits
 
   // Add Reseller State
   const [formData, setFormData] = useState({
     name: '',
     phone: '',
     secret_code: '1234',
+    product_id: '',
     credits_balance: 10,
     notes: ''
   });
@@ -42,8 +46,11 @@ export default function ResellerManager() {
   const loadResellers = async () => {
     try {
       setLoading(true);
-      const data = await adminApi.getResellers();
+      const [data, prods] = await Promise.all([adminApi.getResellers(), adminApi.getProducts()]);
       setResellers(data);
+      setProducts(prods);
+      if (prods.length && !creditProductId) setCreditProductId(String(prods[0].id));
+      if (prods.length && !formData.product_id) setFormData((f) => ({ ...f, product_id: String(prods[0].id) }));
     } catch (err) {
       console.error(err);
     } finally {
@@ -64,13 +71,14 @@ export default function ResellerManager() {
     try {
       await adminApi.createReseller(formData);
       setShowAddModal(false);
-      setFormData({
+      setFormData((f) => ({
         name: '',
         phone: '',
         secret_code: '1234',
+        product_id: f.product_id || (products[0] ? String(products[0].id) : ''),
         credits_balance: 10,
         notes: ''
-      });
+      }));
       loadResellers();
     } catch (err) {
       alert('Error creating reseller: ' + err.message);
@@ -79,15 +87,15 @@ export default function ResellerManager() {
 
   const handleAdjustCredits = async (e) => {
     e.preventDefault();
-    if (!selectedReseller) return;
+    if (!selectedReseller || !creditProductId) return;
     try {
-      await adminApi.adjustCredits(
-        selectedReseller.id,
-        creditAmount,
-        creditReason,
-        creditNote
-      );
+      if (legacyMode) {
+        await adminApi.assignLegacyCredits(selectedReseller.id, creditProductId, creditAmount);
+      } else {
+        await adminApi.adjustCredits(selectedReseller.id, creditProductId, creditAmount, creditReason, creditNote);
+      }
       setShowCreditModal(false);
+      setLegacyMode(false);
       loadResellers();
     } catch (err) {
       alert('Error adjusting credits: ' + err.message);
@@ -200,22 +208,42 @@ export default function ResellerManager() {
                   </div>
                 </div>
 
-                {/* Credits Wallet Card */}
-                <div className="p-3 bg-gradient-to-br from-[#2f2f2f] to-[#2f2f2f] rounded-xl border border-white/15 mb-4 flex items-center justify-between">
-                  <div>
-                    <span className="text-[10px] uppercase font-bold text-[#8e8ea0] block">Wallet Credits</span>
-                    <span className="text-xl font-bold text-[#ececec] font-mono">{r.credits_balance}</span>
-                    <span className="text-[11px] text-[#8e8ea0] ml-1">Credits</span>
+                {/* Per-product Credits Card */}
+                <div className="p-3 bg-[#2f2f2f] rounded-xl border border-white/15 mb-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <div>
+                      <span className="text-[10px] uppercase font-bold text-[#8e8ea0] block">Credits (per product)</span>
+                      <span className="text-lg font-bold text-[#ececec] font-mono">{r.credits_balance}</span>
+                      <span className="text-[11px] text-[#8e8ea0] ml-1">total</span>
+                    </div>
+                    <button
+                      onClick={() => { setSelectedReseller(r); setLegacyMode(false); setCreditAmount(10); setShowCreditModal(true); }}
+                      className="px-3 py-1.5 bg-white hover:bg-white/90 text-black font-bold text-xs rounded-lg shadow-sm transition-all"
+                    >
+                      Adjust
+                    </button>
                   </div>
-                  <button
-                    onClick={() => {
-                      setSelectedReseller(r);
-                      setShowCreditModal(true);
-                    }}
-                    className="px-3 py-1.5 bg-white hover:bg-white/90 text-black font-bold text-xs rounded-lg shadow-sm transition-all"
-                  >
-                    Adjust
-                  </button>
+                  {r.product_credits && r.product_credits.filter((c) => c.credits > 0).length > 0 ? (
+                    <div className="space-y-1">
+                      {r.product_credits.filter((c) => c.credits > 0).map((c) => (
+                        <div key={c.product_id} className="flex items-center justify-between text-[11px]">
+                          <span className="text-[#d4d4d4] truncate max-w-[170px]">{c.product_name.split(' (')[0]}</span>
+                          <span className="font-mono font-bold text-[#ececec]">{c.credits}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-[#8e8ea0]">Kisi product ke credits nahi — Adjust se do.</div>
+                  )}
+                  {r.legacy_unassigned_credits > 0 && (
+                    <button
+                      onClick={() => { setSelectedReseller(r); setLegacyMode(true); setCreditAmount(r.legacy_unassigned_credits); setShowCreditModal(true); }}
+                      className="mt-2 w-full text-left text-[11px] px-2 py-1.5 rounded-lg bg-amber-950/40 text-amber-300 border border-amber-500/30 hover:bg-amber-950/60"
+                      title="Purane generic credits — kisi product ko assign karo tabhi claim honge"
+                    >
+                      ⚠ {r.legacy_unassigned_credits} unassigned credit(s) → product ko assign karo
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -240,15 +268,32 @@ export default function ResellerManager() {
           <div className="w-full max-w-md bg-[#2f2f2f] border border-white/15 rounded-2xl p-6 text-[#ececec]">
             <h3 className="text-base font-bold text-[#ececec] mb-2 flex items-center gap-2">
               <CreditCard className="w-5 h-5 text-[#ececec]" />
-              Adjust Credits: {selectedReseller.name}
+              {legacyMode ? 'Assign unassigned credits' : 'Adjust Credits'}: {selectedReseller.name}
             </h3>
             <p className="text-xs text-[#8e8ea0] mb-4">
-              Current Balance: <strong className="text-[#ececec]">{selectedReseller.credits_balance} Credits</strong>
+              {legacyMode
+                ? <>Unassigned: <strong className="text-amber-300">{selectedReseller.legacy_unassigned_credits}</strong> — choose which product these credits are for.</>
+                : <>Credits are <strong className="text-[#ececec]">per product</strong>. Total now: <strong className="text-[#ececec]">{selectedReseller.credits_balance}</strong></>}
             </p>
 
             <form onSubmit={handleAdjustCredits} className="space-y-3.5 text-xs">
               <div>
-                <label className="block text-[#8e8ea0] mb-1 font-medium">Credit Amount (+ for topup, - for deduction) *</label>
+                <label className="block text-[#8e8ea0] mb-1 font-medium">Product (credits sirf isi ke liye) *</label>
+                <select
+                  value={creditProductId}
+                  onChange={(e) => setCreditProductId(e.target.value)}
+                  required
+                  className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] focus:outline-none focus:border-white/15"
+                >
+                  {products.map((p) => {
+                    const have = (selectedReseller.product_credits || []).find((c) => c.product_id === p.id)?.credits || 0;
+                    return <option key={p.id} value={p.id}>{p.name} — currently {have}</option>;
+                  })}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[#8e8ea0] mb-1 font-medium">{legacyMode ? 'Credits to assign *' : 'Credit Amount (+ for topup, - for deduction) *'}</label>
                 <input
                   type="number"
                   value={creditAmount}
@@ -284,9 +329,9 @@ export default function ResellerManager() {
               </div>
 
               <div className="p-2.5 bg-[#212121] rounded-xl border border-white/10 flex justify-between items-center text-xs">
-                <span className="text-[#8e8ea0]">New Balance after change:</span>
+                <span className="text-[#8e8ea0]">Is product ke credits after change:</span>
                 <span className="font-bold text-[#ececec] font-mono">
-                  {Math.max(0, selectedReseller.credits_balance + creditAmount)} Credits
+                  {Math.max(0, ((selectedReseller.product_credits || []).find((c) => String(c.product_id) === String(creditProductId))?.credits || 0) + creditAmount)} Credits
                 </span>
               </div>
 
@@ -368,6 +413,18 @@ export default function ResellerManager() {
                     className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] focus:outline-none focus:border-white/15"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-[#8e8ea0] mb-1 font-medium">Credits kis product ke liye? *</label>
+                <select
+                  value={formData.product_id}
+                  onChange={(e) => setFormData({ ...formData, product_id: e.target.value })}
+                  className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] focus:outline-none focus:border-white/15"
+                >
+                  {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                <span className="text-[10px] text-[#8e8ea0] mt-1 block">Reseller sirf isi product ki link claim kar payega. Aur products baad me "Adjust" se add karo.</span>
               </div>
 
               <div>
