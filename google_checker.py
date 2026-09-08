@@ -243,6 +243,24 @@ def is_ready() -> bool:
     return playwright_installed() and session_present() and enabled_in_settings() and browser_available()
 
 
+def not_ready_reason() -> Optional[str]:
+    """Why the checker is NOT verifying right now (None when it is). Shown to the admin, never to buyers."""
+    if not playwright_installed():
+        return "playwright not installed on the server"
+    if not browser_available():
+        return "Chromium not installed (python3 -m playwright install --with-deps chromium)"
+    if not session_present():
+        return "no Google session connected (Admin -> Settings -> Google Link Checker)"
+    if not enabled_in_settings():
+        return "disabled in Settings"
+    if _read_status().get("logged_in") is False:
+        return "Google session expired - reconnect in Settings"
+    down = _down_result()
+    if down:
+        return f"paused after '{down.status}' ({down.reason})"
+    return None
+
+
 def _hour_count(bucket: str) -> int:
     b = _RATE[bucket]
     return b["count"] if time.time() - b["window_start"] < 3600 else 0
@@ -265,6 +283,7 @@ def checker_status() -> Dict[str, Any]:
         "probe_checks_this_hour": _hour_count("probe"),
         "max_per_hour": Config.GOOGLE_CHECKER_MAX_PER_HOUR,
         "cooldown_seconds_left": max(0, int(_DOWN["until"] - time.time())) if _DOWN["status"] else 0,
+        "not_ready_reason": not_ready_reason(),
         "screenshot_available": LAST_SHOT.exists(),
         "dir": str(CHECKER_DIR),
     }

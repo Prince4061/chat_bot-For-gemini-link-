@@ -205,3 +205,37 @@ def test_probe_checks_never_trip_the_sale_circuit_breaker(monkeypatch, tmp_path)
     finally:
         gcm._DOWN["until"] = 0.0
         gcm._DOWN["status"] = None
+
+
+# ---- admin can see WHY a Gemini link went out unverified ------------------------------------
+
+def test_unverified_google_link_records_skipped_reason_for_admin(db, fresh_reseller, monkeypatch):
+    from agent_core import run_deep_agent_chat
+    p, links = _google_product(db, n_links=1)
+    monkeypatch.setattr(gcm, "is_ready", lambda: False)
+    monkeypatch.setattr(gcm, "not_ready_reason", lambda: "no Google session connected (test)")
+    monkeypatch.setattr(link_checker, "_http_probe", lambda u: "unknown")
+    out = run_deep_agent_chat(f"wa_s_{fresh_reseller.phone}", f"{p.name} ki link do",
+                              platform="whatsapp", owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    assert links[0] in out["message"] and "verify" not in out["message"].lower()      # buyer: link, no noise
+    chips = [t for t in out["metadata"]["tool_calls"] if t["tool"] == "link_check"]
+    assert chips and chips[0]["ok"] is False and chips[0]["detail"].startswith("skipped: no Google session")
+
+
+def test_not_ready_reason_explains_each_blocker(monkeypatch, tmp_path):
+    monkeypatch.setattr(gcm, "CHECKER_DIR", tmp_path)
+    monkeypatch.setattr(gcm, "STATUS_FILE", tmp_path / "status.json")
+    monkeypatch.setattr(gcm, "playwright_installed", lambda: False)
+    assert "playwright" in gcm.not_ready_reason()
+    monkeypatch.setattr(gcm, "playwright_installed", lambda: True)
+    monkeypatch.setattr(gcm, "browser_available", lambda: False)
+    assert "Chromium" in gcm.not_ready_reason()
+    monkeypatch.setattr(gcm, "browser_available", lambda: True)
+    monkeypatch.setattr(gcm, "session_present", lambda: False)
+    assert "session" in gcm.not_ready_reason()
+    monkeypatch.setattr(gcm, "session_present", lambda: True)
+    monkeypatch.setattr(gcm, "enabled_in_settings", lambda: True)
+    gcm._write_status(logged_in=False)
+    assert "expired" in gcm.not_ready_reason()
+    gcm._write_status(logged_in=True)
+    assert gcm.not_ready_reason() is None

@@ -28,8 +28,10 @@ export default function InventoryManager() {
   const [uploadMsg, setUploadMsg] = useState('');
   const [uploadErr, setUploadErr] = useState('');
   const [rechecking, setRechecking] = useState(false);
+  const [checker, setChecker] = useState(null);   // Google link checker status (verifies Gemini links)
 
   const loadData = async () => {
+    adminApi.googleCheckerStatus().then(setChecker).catch(() => setChecker(null));
     try {
       setLoading(true);
       const [invData, prodData] = await Promise.all([
@@ -159,6 +161,24 @@ export default function InventoryManager() {
           </button>
         </div>
       </div>
+
+      {/* Google Link Checker state: are Gemini links actually verified before delivery? */}
+      {checker && (
+        <div className={`rounded-2xl px-4 py-3 border text-xs flex flex-wrap items-center gap-x-3 gap-y-1 ${checker.ready && checker.logged_in !== false ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-200' : 'bg-amber-950/30 border-amber-500/30 text-amber-200'}`}>
+          <ShieldCheck className="w-4 h-4 shrink-0" />
+          {checker.ready && checker.logged_in !== false ? (
+            <span><b>Google Link Checker: ON</b> — har Gemini link dene se pehle Google par live verify hoti hai
+              {checker.logged_in ? ' (session connected ✓)' : ' (session saved — pehli check par confirm hoga)'}.
+              Checks this hour: {checker.checks_this_hour}/{checker.max_per_hour}</span>
+          ) : (
+            <span><b>Google Link Checker: OFF</b> — Gemini links abhi <b>verify NAHI</b> ho rahi.
+              Reason: {checker.not_ready_reason || 'unknown'}. Fix: <b>Settings → Google Link Checker</b>
+              {!checker.session_present && ' (throwaway Gmail se `python google_checker.py login` → JSON paste → Connect)'}
+              {checker.installed && !checker.browser_ok && ' (VPS: python3 -m playwright install --with-deps chromium)'}.
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Bulk Upload Section */}
       <div className="glass-panel rounded-2xl p-5 border border-white/10">

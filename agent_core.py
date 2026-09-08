@@ -540,12 +540,29 @@ def _summarise_tool_outcome(messages: List[Any]) -> str:
 _CATALOG_KEYWORDS = ("product", "rate", "price", "list", "catalog", "catalogue", "kitne", "cost", "kya hai", "batao", "dikhao", "menu", "available")
 
 
+def _record_skipped_check(res: Dict[str, Any]) -> None:
+    try:
+        from link_checker import is_checkable
+        delivered = list((res or {}).get("links") or ([] if not (res or {}).get("link") else [res["link"]]))
+        if not any(is_checkable(l) for l in delivered):
+            return
+        import google_checker
+        reason = google_checker.not_ready_reason() or "browser gave no verdict"
+        record_tool_call("link_check", False, f"skipped: {reason}")
+        logger.warning("Google link delivered WITHOUT live verification: %s", reason)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _verification_line(res: Dict[str, Any]) -> str:
     """Tell the buyer whether the delivered link was live-verified by the logged-in Google checker.
     Also records a `link_check` tool-call so the admin Bot Tester shows it."""
     v = (res or {}).get("link_verification") or {}
     if v.get("method") != "browser" or not v.get("checked"):
-        return ""   # nothing was live-checked (non-Google product, checker off) -> say nothing
+        # Nothing was live-checked. Say nothing to the buyer, but if a Google link went out
+        # unverified, tell the admin why (Bot Tester `link_check` chip / logs).
+        _record_skipped_check(res)
+        return ""
     many = len(v.get("links_health") or []) > 1
     if v.get("verified_fresh"):
         record_tool_call("link_check", True, f"fresh (Google live check); skipped used={v.get('skipped_used', 0)}")
