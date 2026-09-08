@@ -268,6 +268,14 @@ def claim_reseller_product_link(product_name: str, quantity: int = 1, phone: str
         result = process_reseller_claim_for(reseller, product, quantity, db)
         record_tool_call("claim_reseller_product_link", bool(result.get("success")), result.get("error", product.slug))
         if result.get("success"):
+            v = result.get("link_verification") or {}
+            if v.get("method") == "browser" and v.get("checked"):
+                record_tool_call("link_check", bool(v.get("verified_fresh")),
+                                 "fresh (Google live check)" if v.get("verified_fresh") else f"not verified: {v.get('links_health')}")
+                result["verification_note"] = (
+                    "Tell the reseller the link(s) were live-verified on Google as FRESH." if v.get("verified_fresh")
+                    else "The link could not be live-verified this time; tell them to reply 'link used' if it doesn't work. Do not speculate why."
+                )
             result["delivery_note"] = (
                 "Each link is single-use and has been permanently burned from stock. "
                 "Present every link clearly, one per line, in a code block."
@@ -419,6 +427,7 @@ def confirm_customer_payment_and_deliver(payment_ref: str, order_id: str = "") -
                 "single_use_invite_link": result["link"],
                 "message": result["message"],
                 "security_note": "Private single-use link - once activated it cannot be used again.",
+                "link_verification": result.get("link_verification"),
             })
         return _json({"status": result.get("error", "error").lower(), "order_id": order.id, "message": result.get("message")})
     except Exception as exc:

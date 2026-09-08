@@ -1,15 +1,29 @@
 """
-Link freshness checker.
+Link freshness checker (Google One / Gemini activation links).
 
-Some invite links (notably Google One / Gemini) are fresh when added but get consumed
-later. A USED Google link redirects to `serviceactivation.google.com`, while a FRESH one
-stays on `one.google.com/activate-plan`. We check this lazily — only when a user actually
-asks for a link — so the bot never hands out a used link.
+IMPORTANT (learned from real links): both FRESH and USED Gemini links can live on
+`serviceactivation.google.com` or `one.google.com/activate-plan/...`, so the host name says
+NOTHING about freshness. An unauthenticated server request is usually redirected to the
+Google login page for fresh and used links alike, which also cannot tell them apart.
 
-Return values: "fresh" | "used" | "unknown".
-Only URLs we know how to verify are "checkable"; everything else is left untouched.
+Order of evidence:
+  1. The logged-in browser checker (google_checker) when the admin connected a Google session:
+     it reads Google's own "already used / expired / Activate plan" page -> authoritative.
+  2. Otherwise (or when the browser is inconclusive: busy, rate-limited, dead session, error)
+     the conservative HTTP probe below:
+       * "used"    -> only on STRONG evidence: HTTP 404/410, or an explicit "already redeemed /
+                      expired / invalid" message on a page that is NOT the login page.
+       * "fresh"   -> the activation page itself loaded (no login wall) without such a message.
+       * "unknown" -> login wall / network error / anything ambiguous. Callers hand these out
+                      normally; we never block a sale on uncertainty.
+
+check_link_freshness_detail() returns (health, method), method in browser | browser-fallback | http | none.
 """
 import logging
+import re
+from typing import Tuple
+from urllib.parse import urlparse
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -21,48 +35,89 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# The single DEFINITIVE signal: a USED Google/Gemini link ends up on this host.
-# A FRESH link stays on one.google.com or bounces to accounts.google.com (login) —
-# both are normal. We deliberately do NOT scan page text, because Google's login/consent
-# pages contain generic phrases ("not available", etc.) that caused fresh links to be
-# wrongly flagged as used.
-_GOOGLE_USED_HOST = "serviceactivation.google.com"
+_GOOGLE_HOSTS = ("one.google.com", "serviceactivation.google.com", "families.google.com")
+
+# Strong, explicit "consumed" wording. Deliberately NOT generic phrases like "not available",
+# which appear on Google's login/consent pages and caused false positives before.
+_USED_MARKERS = (
+    "already been redeemed", "already redeemed", "has already been used", "already been used",
+    "this offer has expired", "offer has expired", "this link has expired", "code has already been used",
+    "promotion has already been redeemed", "no longer available for redemption",
+)
 
 
 def is_checkable(url: str) -> bool:
-    """True only for links whose freshness we know how to verify (currently Google One / Gemini)."""
-    u = (url or "").lower()
-    return u.startswith("http") and ("one.google.com" in u or "serviceactivation.google.com" in u
-                                     or "families.google.com" in u)
+    """True only for links we know how to look at (Google One / Gemini family). Exact host match:
+    'one.google.com.evil.io' or 'https://x/?u=one.google.com' are NOT checkable."""
+    try:
+        p = urlparse((url or "").strip())
+    except ValueError:
+        return False
+    return p.scheme in ("http", "https") and (p.hostname or "").lower() in _GOOGLE_HOSTS
 
 
-def check_link_freshness(url: str) -> str:
-    """
-    Returns "fresh" | "used" | "unknown".
-    Conservative on purpose: a link is "used" ONLY if it (originally or after redirects)
-    lands on the used-activation host. Any ambiguity or network error is "unknown", which
-    the caller hands out normally — we never block a sale on a fresh/uncertain link.
-    """
-    if not is_checkable(url):
-        return "unknown"
+def _is_login_wall(final_url: str) -> bool:
+    return "accounts.google.com" in final_url or "/signin" in final_url or "servicelogin" in final_url
 
-    # A link that is ALREADY the used-activation host is definitely used.
-    if _GOOGLE_USED_HOST in url.lower():
-        return "used"
 
+def _http_probe(url: str) -> str:
     try:
         resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT, allow_redirects=True)
     except requests.RequestException as exc:
-        logger.warning("Link check failed (%s): %s", url[:60], exc)
+        logger.warning("Link check failed (%s...): %s", url[:40], type(exc).__name__)
         return "unknown"
 
-    # Check the final URL and the whole redirect chain for the used host.
-    urls = [(resp.url or "").lower()] + [(r.url or "").lower() for r in resp.history]
-    if any(_GOOGLE_USED_HOST in u for u in urls):
+    final_url = (resp.url or "").lower()
+
+    # Dead link: Google removed/expired the activation resource.
+    if resp.status_code in (404, 410):
         return "used"
 
-    # Reachable Google page that did NOT bounce to the used host -> fresh.
-    final_url = (resp.url or "").lower()
-    if "google.com" in final_url and resp.status_code < 400:
+    # Behind the login wall we cannot see the offer state -> unknown (not "fresh", not "used").
+    if _is_login_wall(final_url):
+        return "unknown"
+
+    body = ""
+    try:
+        body = re.sub(r"\s+", " ", resp.text[:60000].lower())
+    except Exception:  # noqa: BLE001
+        body = ""
+    if any(m in body for m in _USED_MARKERS):
+        return "used"
+
+    if resp.status_code < 400 and "google.com" in final_url:
         return "fresh"
     return "unknown"
+
+
+def check_link_freshness_detail(url: str, allow_browser: bool = True) -> Tuple[str, str]:
+    """
+    Returns (health, method): health in fresh | used | unknown, method in browser | browser-fallback | http | none.
+    Never returns "used" without explicit evidence.
+    """
+    if not is_checkable(url):
+        return "unknown", "none"
+    if allow_browser:
+        try:
+            import google_checker
+            if google_checker.is_ready():
+                r = google_checker.check_link(url)
+                if r.status in ("used", "expired"):
+                    return "used", "browser"
+                if r.status == "fresh":
+                    return "fresh", "browser"
+                # logged_out / ineligible / unknown / error / busy / rate_limited -> not a verdict.
+                # Fall through to the cheap HTTP probe so 404/410 dead links are still caught.
+                logger.info("Browser checker inconclusive for %s...: %s (%s) - HTTP probe next",
+                            url[:40], r.status, r.reason)
+                # "browser-fallback": the browser was attempted on this link but gave no verdict, so the
+                # buyer is told it could not be live-verified (plain "http" = browser never involved).
+                return _http_probe(url), "browser-fallback"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("google_checker unavailable (%s); falling back to HTTP probe", type(exc).__name__)
+    return _http_probe(url), "http"
+
+
+def check_link_freshness(url: str, allow_browser: bool = True) -> str:
+    """See module docstring. Returns "fresh" | "used" | "unknown"."""
+    return check_link_freshness_detail(url, allow_browser)[0]

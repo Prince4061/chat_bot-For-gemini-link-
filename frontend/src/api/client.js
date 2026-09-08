@@ -146,6 +146,18 @@ export const adminApi = {
   getSettings: async () => (await api.get('/admin/settings')).data,
   updateSettings: async (settingsData) => (await api.post('/admin/settings', settingsData)).data,
 
+  // Google Link Checker (logged-in headless browser that reads Google's "already used" page)
+  googleCheckerStatus: async () => (await api.get('/admin/google-checker/status')).data,
+  googleCheckerConnect: async (sessionJson) => (await api.post('/admin/google-checker/session', { session: sessionJson })).data,
+  googleCheckerDisconnect: async () => (await api.delete('/admin/google-checker/session')).data,
+  googleCheckerVerify: async () => (await api.post('/admin/google-checker/verify')).data,
+  googleCheckerTest: async (url) => (await api.post('/admin/google-checker/test', { url })).data,
+  // Fetched through the axios client so the X-Admin-Token header is sent; returns an object URL.
+  googleCheckerScreenshot: async () => {
+    const res = await api.get('/admin/google-checker/screenshot', { responseType: 'blob', params: { t: Date.now() } });
+    return URL.createObjectURL(res.data);
+  },
+
   // Bot Tester (live chat with debug info)
   botTest: async (payload) => (await api.post('/admin/bot/test', payload)).data,
   botTestReset: async (sessionId) => (await api.post('/admin/bot/test/reset', { session_id: sessionId })).data,

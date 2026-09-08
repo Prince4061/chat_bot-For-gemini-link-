@@ -21,8 +21,8 @@ def test_ensure_fresh_stock_marks_used_and_keeps_fresh(db, monkeypatch):
     used_tokens = {links[0].link_or_key, links[1].link_or_key}
 
     monkeypatch.setattr(link_checker, "is_checkable", lambda u: True)
-    monkeypatch.setattr(link_checker, "check_link_freshness",
-                        lambda u: "used" if u in used_tokens else "fresh")
+    monkeypatch.setattr(link_checker, "check_link_freshness_detail",
+                        lambda u, allow_browser=True: ("used" if u in used_tokens else "fresh", "http"))
 
     res = dbm.ensure_fresh_stock(db, p.id)
     assert res["marked_used"] == 2
@@ -39,8 +39,8 @@ def test_customer_fulfillment_delivers_fresh_link(db, monkeypatch):
     links = db.query(dbm.InviteLink).filter_by(product_id=p.id).order_by(dbm.InviteLink.id).all()
     fresh_link = links[2].link_or_key
     monkeypatch.setattr(link_checker, "is_checkable", lambda u: True)
-    monkeypatch.setattr(link_checker, "check_link_freshness",
-                        lambda u: "fresh" if u == fresh_link else "used")
+    monkeypatch.setattr(link_checker, "check_link_freshness_detail",
+                        lambda u, allow_browser=True: ("fresh" if u == fresh_link else "used", "http"))
 
     order = dbm.CustomerOrder(id=dbm.generate_order_id(db), product_id=p.id, unit_price=100, total_amount=100, session_id="s_fresh")
     db.add(order); db.commit()

@@ -41,3 +41,7 @@ Thumbs.db
 
 # Claude Code local
 .claude/
+
+# Google link checker: live Google login cookies + local Chrome profile (NEVER commit)
+google_session.json
+google_checker_local_profile/

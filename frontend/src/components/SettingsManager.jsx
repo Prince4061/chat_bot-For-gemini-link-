@@ -77,6 +77,68 @@ export default function SettingsManager() {
     }
   };
 
+  // --- Google Link Checker (logged-in headless browser) ---
+  const [gc, setGc] = useState(null);            // status object
+  const [gcSession, setGcSession] = useState(''); // pasted google_session.json / cookie export
+  const [gcBusy, setGcBusy] = useState('');
+  const [gcMsg, setGcMsg] = useState(null);      // {ok, text}
+  const [gcTestUrl, setGcTestUrl] = useState('');
+  const [gcTest, setGcTest] = useState(null);
+  const [gcShot, setGcShot] = useState(null);      // object URL of the last screenshot
+
+  const loadChecker = async () => {
+    try { setGc(await adminApi.googleCheckerStatus()); } catch (err) { console.error(err); }
+  };
+  useEffect(() => { loadChecker(); }, []);
+
+  const gcConnect = async () => {
+    if (!gcSession.trim()) return;
+    let parsed;
+    try { parsed = JSON.parse(gcSession); } catch { setGcMsg({ ok: false, text: 'Ye valid JSON nahi hai — google_session.json ka poora content paste karo.' }); return; }
+    try {
+      setGcBusy('connect'); setGcMsg(null);
+      const res = await adminApi.googleCheckerConnect(parsed);
+      const v = res.verification;
+      setGcMsg({ ok: !v || v.status === 'logged_in', text: v ? (v.status === 'logged_in' ? `✅ Connected — Google session kaam kar raha hai (${res.saved.cookies} cookies).` : `Saved, par verify: ${v.status} — ${v.reason}`) : `Saved (${res.saved.cookies} cookies). Server par playwright install nahi hai, verify baad me hoga.` });
+      setGcSession('');
+      setGc(res.status);
+    } catch (err) { setGcMsg({ ok: false, text: 'Error: ' + err.message }); }
+    finally { setGcBusy(''); }
+  };
+
+  const gcVerify = async () => {
+    try { setGcBusy('verify'); setGcMsg(null); const res = await adminApi.googleCheckerVerify(); setGc(res.status);
+      setGcMsg({ ok: res.result.status === 'logged_in', text: `${res.result.status}: ${res.result.reason}` }); }
+    catch (err) { setGcMsg({ ok: false, text: 'Error: ' + err.message }); }
+    finally { setGcBusy(''); }
+  };
+
+  const gcDisconnect = async () => {
+    if (!confirm('Google checker session disconnect karein? (Gemini links phir verify nahi hongi)')) return;
+    try { const res = await adminApi.googleCheckerDisconnect(); setGc(res.status); setGcMsg({ ok: true, text: 'Disconnected.' }); }
+    catch (err) { setGcMsg({ ok: false, text: 'Error: ' + err.message }); }
+  };
+
+  const gcRunTest = async () => {
+    if (!gcTestUrl.trim()) return;
+    try {
+      setGcBusy('test'); setGcTest(null);
+      if (gcShot) { URL.revokeObjectURL(gcShot); setGcShot(null); }
+      const res = await adminApi.googleCheckerTest(gcTestUrl.trim());
+      setGcTest(res.result); setGc(res.status);
+      if (res.result?.screenshot) {
+        try { setGcShot(await adminApi.googleCheckerScreenshot()); } catch { /* no screenshot */ }
+      }
+    }
+    catch (err) { setGcTest({ status: 'error', reason: err.response?.data?.error || err.message }); }
+    finally { setGcBusy(''); }
+  };
+
+  const gcToggle = async (val) => {
+    try { const saved = await adminApi.updateSettings({ google_checker_enabled: val }); setSettings(saved); loadChecker(); }
+    catch (err) { alert('Error: ' + err.message); }
+  };
+
   const handleTestLlm = async () => {
     try {
       setTesting(true);
@@ -268,6 +330,99 @@ export default function SettingsManager() {
             {!settings.has_openai_key && (
               <span className="text-amber-400">No key saved — the bot runs on the rule-based fallback engine.</span>
             )}
+          </div>
+        </div>
+
+        {/* Google Link Checker — logged-in headless browser reads Google's used/fresh page */}
+        <div className="glass-panel rounded-2xl p-5 border border-white/10 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-[#ececec] flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-[#ececec]" />
+              Google Link Checker (Gemini links fresh/used)
+            </h3>
+            {gc && (
+              <div className="flex items-center gap-2 text-[11px]">
+                <span className={`px-2 py-0.5 rounded-full border ${gc.installed && gc.browser_ok ? 'bg-[#2f2f2f] text-[#ececec] border-white/15' : 'bg-rose-950/40 text-rose-300 border-rose-500/30'}`}
+                  title={gc.installed && !gc.browser_ok ? 'Server par chalao: python3 -m playwright install --with-deps chromium' : ''}>
+                  {gc.installed ? (gc.browser_ok ? 'Chromium ✓' : 'Chromium missing') : 'Playwright missing'}
+                </span>
+                <span className={`px-2 py-0.5 rounded-full border ${gc.session_present ? (gc.logged_in === false ? 'bg-amber-950/40 text-amber-300 border-amber-500/30' : 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30') : 'bg-[#3a3a3a] text-[#8e8ea0] border-white/10'}`}>
+                  {gc.session_present ? (gc.logged_in === false ? 'Session expired' : gc.logged_in ? 'Connected' : 'Session saved') : 'Not connected'}
+                </span>
+                <label className="flex items-center gap-1 text-[#8e8ea0] cursor-pointer">
+                  <input type="checkbox" checked={settings.google_checker_enabled !== false} onChange={(e) => gcToggle(e.target.checked)} />
+                  enabled
+                </label>
+              </div>
+            )}
+          </div>
+
+          <p className="text-[11px] text-[#8e8ea0] leading-relaxed">
+            Google bina login ke fresh/used nahi batata. Ye checker ek <strong className="text-[#ececec]">alag (throwaway) Google account</strong> ke logged-in
+            session se link kholta hai, sirf page <em>padhta</em> hai (Activate kabhi click nahi karta — isliye link consume nahi hoti), aur
+            "already used / expired" mile to us link ko skip karke agli fresh link deta hai.
+          </p>
+
+          <div className="p-3 bg-[#212121] rounded-xl border border-white/10 text-[11px] text-[#d4d4d4] space-y-1">
+            <div className="font-semibold text-[#ececec]">Connect karne ke 3 steps</div>
+            <div>1. Ek naya Gmail banao jisme <strong>Google One / Gemini plan na ho</strong> (main business Gmail mat use karo).</div>
+            <div>2. Apne PC par project folder me chalao: <code className="text-[#ececec] bg-black/30 px-1 rounded">pip install playwright</code>, <code className="text-[#ececec] bg-black/30 px-1 rounded">playwright install chromium</code>, phir <code className="text-[#ececec] bg-black/30 px-1 rounded">python google_checker.py login</code> → Chrome khulega, us account se sign in karo, Enter dabao → <code className="text-[#ececec] bg-black/30 px-1 rounded">google_session.json</code> banega.</div>
+            <div>3. Us file ka poora content neeche paste karke <strong>Connect</strong> dabao. (Cookie-Editor extension ka cookie export bhi chalta hai.)</div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 text-xs">
+            <div>
+              <label className="block text-[#8e8ea0] mb-1 font-medium">google_session.json ka content</label>
+              <textarea
+                rows={5}
+                value={gcSession}
+                onChange={(e) => setGcSession(e.target.value)}
+                placeholder='{"cookies":[{"name":"SID","value":"…","domain":".google.com",…}], "origins":[]}'
+                className="w-full p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono text-[11px] focus:outline-none focus:border-white/20"
+              />
+              <div className="flex flex-wrap items-center gap-2 mt-2">
+                <button type="button" onClick={gcConnect} disabled={gcBusy !== '' || !gcSession.trim()}
+                  className="px-4 py-2 bg-white hover:bg-white/90 text-black font-bold rounded-xl disabled:opacity-50">
+                  {gcBusy === 'connect' ? 'Connecting…' : 'Connect'}
+                </button>
+                <button type="button" onClick={gcVerify} disabled={gcBusy !== '' || !gc?.session_present}
+                  className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">
+                  {gcBusy === 'verify' ? 'Checking…' : 'Verify session'}
+                </button>
+                {gc?.session_present && (
+                  <button type="button" onClick={gcDisconnect} className="px-3 py-2 text-rose-300 hover:bg-rose-950/40 rounded-xl">Disconnect</button>
+                )}
+              </div>
+              {gcMsg && <div className={`mt-2 text-[11px] ${gcMsg.ok ? 'text-emerald-300' : 'text-rose-300'}`}>{gcMsg.text}</div>}
+              {gc && (
+                <div className="mt-2 text-[10px] text-[#8e8ea0]">
+                  Last check: {gc.last_check_at || '—'} · result: {gc.last_status || '—'} · this hour: {gc.checks_this_hour}/{gc.max_per_hour}
+                  {gc.last_error && <span className="text-amber-300"> · {gc.last_error}</span>}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-[#8e8ea0] mb-1 font-medium">Test — ek Gemini link paste karo (sirf padhega, activate nahi karega)</label>
+              <div className="flex items-center gap-2">
+                <input value={gcTestUrl} onChange={(e) => setGcTestUrl(e.target.value)} placeholder="https://one.google.com/activate-plan/subscription/new/…"
+                  className="flex-1 p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono text-[11px] focus:outline-none focus:border-white/20" />
+                <button type="button" onClick={gcRunTest} disabled={gcBusy !== '' || !gcTestUrl.trim() || !gc?.installed}
+                  className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">
+                  {gcBusy === 'test' ? 'Checking…' : 'Check'}
+                </button>
+              </div>
+              {gcTest && (
+                <div className="mt-2 p-2.5 rounded-xl bg-[#212121] border border-white/10 text-[11px] space-y-1">
+                  <div>
+                    Result: <span className={`font-bold ${gcTest.status === 'fresh' ? 'text-emerald-300' : (gcTest.status === 'used' || gcTest.status === 'expired') ? 'text-rose-300' : 'text-amber-300'}`}>{gcTest.status?.toUpperCase()}</span>
+                    <span className="text-[#8e8ea0]"> — {gcTest.reason}</span>
+                  </div>
+                  {gcTest.snippet && <div className="text-[#8e8ea0] break-words">“{gcTest.snippet.slice(0, 220)}”</div>}
+                  {gcShot && <img alt="page" src={gcShot} className="mt-1 rounded-lg border border-white/10 max-h-56" />}
+                </div>
+              )}
+            </div>
           </div>
         </div>
 

@@ -15,6 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Chromium for the logged-in Google link checker (installs system deps too). The browsers path
+# is set BEFORE the install so the non-root runtime user finds the binary.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright GOOGLE_CHECKER_DIR=/data/google_checker
+RUN playwright install --with-deps chromium && chmod -R a+rX /ms-playwright
 
 COPY . .
 COPY --from=frontend /app/frontend/dist ./frontend/dist

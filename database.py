@@ -12,6 +12,7 @@ Concurrency model
 * Every multi-step operation runs inside one transaction and is rolled back as a whole.
 """
 import re
+import time
 import secrets
 import string
 import datetime
@@ -168,6 +169,10 @@ class InviteLink(Base):
     # Freshness of the link itself (for auto-verifiable links like Gemini/Google One).
     health = Column(String(20), default="unchecked")     # unchecked | fresh | used | unknown
     health_checked_at = Column(DateTime, nullable=True)
+    # Buyer reported this delivered link as already used -> we flagged it and issued a replacement.
+    reported_used_at = Column(DateTime, nullable=True)
+    reported_by = Column(String(100), nullable=True)      # phone / session that reported it
+    replaced_by_link_id = Column(Integer, nullable=True)  # the free replacement we handed out
     claimed_by_type = Column(String(20), nullable=True)   # "customer" | "reseller" | "admin"
     claimed_by_id = Column(String(100), nullable=True)    # phone / client id
     claimed_at = Column(DateTime, nullable=True)
@@ -186,6 +191,9 @@ class InviteLink(Base):
             "status": self.status,
             "health": self.health or "unchecked",
             "health_checked_at": self.health_checked_at.isoformat() if self.health_checked_at else None,
+            "reported_used_at": self.reported_used_at.isoformat() if self.reported_used_at else None,
+            "reported_by": self.reported_by,
+            "replaced_by_link_id": self.replaced_by_link_id,
             "claimed_by_type": self.claimed_by_type,
             "claimed_by_id": self.claimed_by_id,
             "claimed_at": self.claimed_at.isoformat() if self.claimed_at else None,
@@ -406,6 +414,8 @@ class SystemSettings(Base):
     openai_model_name = Column(String(50), default=Config.OPENAI_MODEL_NAME)
     # Free-text extra instructions the admin trains the agent with (persona, rules, tone...).
     agent_instructions = Column(Text, default="")
+    # Logged-in browser checker for Gemini links (google_checker.py) can be paused from the UI.
+    google_checker_enabled = Column(Boolean, default=True)
 
     @staticmethod
     def _mask(value: Optional[str]) -> Optional[str]:
@@ -432,6 +442,7 @@ class SystemSettings(Base):
             "openai_api_key": self._mask(self.openai_api_key),
             "has_openai_key": bool(self.openai_api_key or Config.OPENAI_API_KEY),
             "agent_instructions": self.agent_instructions or "",
+            "google_checker_enabled": True if self.google_checker_enabled is None else bool(self.google_checker_enabled),
         }
 
 
@@ -957,30 +968,54 @@ def _claim_links_in_transaction(
     return db.query(InviteLink).filter(InviteLink.id.in_(claimed_ids)).order_by(InviteLink.id).all()
 
 
-def ensure_fresh_stock(db, product_id: int, max_checks: int = 12) -> Dict[str, Any]:
+def ensure_fresh_stock(db, product_id: int, count: int = 1, max_checks: int = 12,
+                       budget_seconds: Optional[float] = None) -> Dict[str, Any]:
     """
-    Lazily verify links AT CLAIM TIME: walk the oldest available links, and for any that
-    are verifiable (e.g. Gemini/Google One), check freshness. Mark USED links as status='used'
-    (so they are never handed out and show up in the admin panel), and stop as soon as the
-    front-most available link is fresh/unknown/non-checkable. Runs OUTSIDE the claim lock
-    (does its own commits) so we never hold a DB lock during network calls.
-    """
-    from link_checker import is_checkable, check_link_freshness  # local import: optional dep
+    Lazily verify links AT CLAIM TIME: walk the oldest available links in order and, for any
+    that are verifiable (Gemini/Google One), check freshness. USED links become status='used'
+    (never handed out, visible in the admin panel). Stops once `count` links that may be handed
+    out (fresh / unknown / non-checkable) have been passed — the same links the claim will burn.
+    Bounded by `max_checks` and a wall-clock budget so a sale never stalls behind the browser.
+    Runs OUTSIDE the claim lock (does its own commits).
 
-    marked_used, checked = 0, 0
-    while checked < max_checks:
+    Returns checked / marked_used / method (browser|http|none) / front_health plus the ids that
+    were checked (`checked_ids`) and the ids the logged-in browser saw as FRESH
+    (`browser_fresh_ids`) — only those may be announced as "live verified".
+    """
+    from link_checker import is_checkable, check_link_freshness_detail  # local import: optional dep
+
+    budget = Config.GOOGLE_CHECKER_CLAIM_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    deadline = time.monotonic() + float(budget)
+    try:
+        count = max(1, int(count or 1))
+    except (TypeError, ValueError):
+        count = 1
+    marked_used = checked = 0
+    passed_ids: List[int] = []
+    checked_ids: List[int] = []
+    browser_fresh_ids: List[int] = []
+    methods = set()
+    last_id = 0
+    while len(passed_ids) < count and checked < max_checks:
         link = (
             db.query(InviteLink)
-            .filter(InviteLink.product_id == product_id, InviteLink.status == "available")
+            .filter(InviteLink.product_id == product_id, InviteLink.status == "available", InviteLink.id > last_id)
             .order_by(InviteLink.id.asc())
             .first()
         )
         if not link:
             break
+        last_id = link.id
         if not is_checkable(link.link_or_key):
-            break  # can't verify this type -> hand it out as-is
+            passed_ids.append(link.id)      # can't verify this type -> hand it out as-is
+            continue
+        if time.monotonic() > deadline:
+            passed_ids.append(link.id)      # out of time -> hand out unverified rather than stall the sale
+            continue
         checked += 1
-        health = check_link_freshness(link.link_or_key)
+        checked_ids.append(link.id)
+        health, method = check_link_freshness_detail(link.link_or_key)
+        methods.add(method)
         link.health = health
         link.health_checked_at = utcnow()
         if health == "used":
@@ -988,9 +1023,38 @@ def ensure_fresh_stock(db, product_id: int, max_checks: int = 12) -> Dict[str, A
             marked_used += 1
             db.commit()
             continue  # try the next available link
+        if health == "fresh" and method == "browser":
+            browser_fresh_ids.append(link.id)
         db.commit()
-        break  # front link is fresh/unknown -> good to hand out
-    return {"checked": checked, "marked_used": marked_used}
+        passed_ids.append(link.id)
+    # "browser" if the logged-in browser was attempted on any of these links (verdict or not).
+    method = "browser" if any(m.startswith("browser") for m in methods) else ("http" if "http" in methods else "none")
+    front = (
+        db.query(InviteLink.health)
+        .filter(InviteLink.product_id == product_id, InviteLink.status == "available")
+        .order_by(InviteLink.id.asc())
+        .first()
+    )
+    return {"checked": checked, "marked_used": marked_used, "method": method,
+            "front_health": (front[0] if front else None) or "unchecked",
+            "checked_ids": checked_ids, "browser_fresh_ids": browser_fresh_ids, "passed_ids": passed_ids}
+
+
+def _link_verification(agg: Dict[str, Any], links: List["InviteLink"]) -> Dict[str, Any]:
+    """Summary handed to the bot so it can tell the buyer whether the link was live-verified.
+    `method` is "browser" only if the logged-in browser actually looked at one of THESE links, and
+    `verified_fresh` only if it saw EVERY delivered link as fresh in this very claim."""
+    healths = [(l.health or "unchecked") for l in links]
+    checked_ids = set(agg.get("checked_ids") or [])
+    browser_fresh = set(agg.get("browser_fresh_ids") or [])
+    touched = any(l.id in checked_ids for l in links)
+    return {
+        "method": (agg.get("method") or "none") if touched else "none",   # browser | http | none
+        "checked": int(agg.get("checked", 0)),
+        "skipped_used": int(agg.get("marked_used", 0)),
+        "links_health": healths,
+        "verified_fresh": bool(links) and all(l.id in browser_fresh for l in links),
+    }
 
 
 def claim_single_use_link(
@@ -1047,9 +1111,9 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
     total_charge = round(unit_charge * quantity, 2)
 
     # Verify freshness lazily before claiming, so resellers only get fresh links.
+    agg: Dict[str, Any] = {"checked": 0, "marked_used": 0, "method": "none"}
     try:
-        for _ in range(quantity):
-            ensure_fresh_stock(db, product.id)
+        agg = ensure_fresh_stock(db, product.id, count=quantity)   # verifies the first `quantity` links
     except Exception:  # noqa: BLE001
         logger.exception("ensure_fresh_stock failed (continuing with unchecked stock)")
 
@@ -1131,6 +1195,7 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
             "balance_display": reseller.money(),
             "currency": (reseller.currency or "INR").upper(),
             "links": [l.link_or_key for l in links],
+            "link_verification": _link_verification(agg, links),
             "links_claimed_ids": [l.id for l in links],
             "reseller_name": reseller.name,
             "reseller_phone": reseller.phone,
@@ -1199,8 +1264,9 @@ def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "cust
         }
 
     # Verify freshness lazily before delivering, so customers only get fresh links.
+    agg: Dict[str, Any] = {"checked": 0, "marked_used": 0, "method": "none"}
     try:
-        ensure_fresh_stock(db, order.product_id)
+        agg = ensure_fresh_stock(db, order.product_id)
     except Exception:  # noqa: BLE001
         logger.exception("ensure_fresh_stock failed (continuing with unchecked stock)")
 
@@ -1241,6 +1307,7 @@ def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "cust
             "product_name": order.product.name if order.product else "Digital Product",
             "link": link.link_or_key,
             "payment_ref": order.payment_ref,
+            "link_verification": _link_verification(agg, [link]),
             "message": "Payment confirmed and single-use link delivered.",
         }
     except Exception as exc:
@@ -1357,8 +1424,23 @@ def init_db() -> None:
             logger.info("Seeded demo products, links and resellers.")
         _migrate_reseller_price_to_margin(db)
         _migrate_credits_to_wallet(db)
+        _backfill_google_checker_enabled(db)
     finally:
         db.close()
+
+
+def _backfill_google_checker_enabled(db) -> None:
+    """`ALTER TABLE ... ADD COLUMN` leaves NULL in existing rows; NULL must mean enabled (the UI default)."""
+    try:
+        n = (db.query(SystemSettings)
+             .filter(SystemSettings.google_checker_enabled.is_(None))
+             .update({"google_checker_enabled": True}, synchronize_session=False))
+        if n:
+            db.commit()
+            logger.info("Migrated: google_checker_enabled NULL -> true on %d settings row(s)", n)
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.warning("google_checker_enabled backfill skipped", exc_info=True)
 
 
 def seed_data(db) -> None:

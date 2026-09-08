@@ -11,6 +11,10 @@ requests>=2.31.0
 qrcode>=7.4.2
 pillow>=10.0.0
 
+# Logged-in headless-browser checker for Google One / Gemini links (google_checker.py).
+# After pip install, run once on the server:  playwright install --with-deps chromium
+playwright>=1.45
+
 # Production WSGI servers (waitress works on Windows + Linux; gunicorn is Linux-only)
 waitress>=3.0.0
 gunicorn>=21.0.0; sys_platform != "win32"

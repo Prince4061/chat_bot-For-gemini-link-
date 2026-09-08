@@ -41,8 +41,12 @@ Phir VPS pe: `cd /root/vending-bot`
 ```bash
 cd /root/vending-bot
 pip3 install -r requirements.txt
+# Ubuntu 24.04 pe "externally-managed-environment" aaye to:
+#   pip3 install --break-system-packages -r requirements.txt
+python3 -m playwright install --with-deps chromium     # Google link checker ke liye Chromium (~300 MB)
 cd frontend && npm install && npm run build && cd ..
 ```
+> Shortcut: `bash deploy/deploy_vps.sh` ye sab (aur service restart + health check) khud kar deta hai.
 
 ## 4. `.env` banao
 ```bash
@@ -113,6 +117,28 @@ Kisi **doosre** WhatsApp se apne connected number pe bhejo: **"products dikhao"*
 
 ---
 
+## Google Link Checker (Gemini links fresh/used) — optional but recommended
+Google bina login ke fresh/used nahi batata, isliye bot ek **alag throwaway Google account** ke
+logged-in headless Chrome se link kholta hai aur Google ka apna "already used / Activate plan" page
+padhta hai (kabhi Activate click nahi karta → link consume nahi hoti).
+
+VPS par ek baar (deploy script ye khud kar deta hai):
+```bash
+cd /root/vending-bot
+python3 -m playwright install --with-deps chromium      # ~300 MB, system deps bhi
+systemctl restart vending-bot
+```
+Apne PC par (jahan screen hai), project folder me:
+```bash
+pip install playwright && playwright install chromium
+python google_checker.py login               # Chrome khulega → throwaway account se sign in → Enter
+```
+`google_session.json` banegi → **Admin → Settings → Google Link Checker** me paste karke **Connect**.
+"Verify session" ✅ dikhe to ho gaya. Session expire ho to bot link block nahi karta (unknown maan ke
+deta hai) — panel me "Session expired" dikhega, dobara login → paste kar do.
+
+> Throwaway account me Google One/Gemini plan **nahi** hona chahiye, warna fresh link bhi "not eligible" dikhegi.
+
 ## Health check
 ```bash
 curl http://localhost:5000/api/health
@@ -129,12 +155,20 @@ curl http://localhost:5000/api/health
 | admin koi bhi khol le raha | `.env` me `ADMIN_API_KEY` set karke `systemctl restart vending-bot` |
 | number baar-baar disconnect | phone online rakho; instance restart + dobara QR |
 
-## Update deploy karna (baad me code badla to)
+## Update deploy karna (baad me code badla to) — ek command
+```bash
+cd /root/vending-bot && git pull && bash deploy/deploy_vps.sh
+```
+Script khud karta hai: git pull → pip deps → Chromium (sirf pehli baar) → frontend build →
+`systemctl restart` → health check + Google checker status. Dobara chalana safe hai.
+
+Manual tarika (agar script na chalana ho):
 ```bash
 cd /root/vending-bot
-git pull                 # ya naya code upload
-pip3 install -r requirements.txt
-cd frontend && npm run build && cd ..
+git pull
+pip3 install -r requirements.txt          # Ubuntu 24.04 pe: pip3 install --break-system-packages -r requirements.txt
+python3 -m playwright install --with-deps chromium   # sirf pehli baar
+cd frontend && npm install && npm run build && cd ..
 systemctl restart vending-bot
 ```
 

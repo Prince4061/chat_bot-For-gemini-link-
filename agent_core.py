@@ -540,6 +540,21 @@ def _summarise_tool_outcome(messages: List[Any]) -> str:
 _CATALOG_KEYWORDS = ("product", "rate", "price", "list", "catalog", "catalogue", "kitne", "cost", "kya hai", "batao", "dikhao", "menu", "available")
 
 
+def _verification_line(res: Dict[str, Any]) -> str:
+    """Tell the buyer whether the delivered link was live-verified by the logged-in Google checker.
+    Also records a `link_check` tool-call so the admin Bot Tester shows it."""
+    v = (res or {}).get("link_verification") or {}
+    if v.get("method") != "browser" or not v.get("checked"):
+        return ""   # nothing was live-checked (non-Google product, checker off) -> say nothing
+    many = len(v.get("links_health") or []) > 1
+    if v.get("verified_fresh"):
+        record_tool_call("link_check", True, f"fresh (Google live check); skipped used={v.get('skipped_used', 0)}")
+        return ("\n\n✅ *Ye sabhi links Google par live verify ki gayi hain — fresh hain.*" if many
+                else "\n\n✅ *Ye link Google par live verify ki gayi hai — fresh hai.*")
+    record_tool_call("link_check", False, f"not verified: {v.get('links_health')}")
+    return "\n\nℹ️ *Link is baar Google par live verify nahi ho paayi. Agar kaam na kare to reply karo: 'link used'.*"
+
+
 def _fmt_links(links: List[str]) -> str:
     return "\n".join(f"`{l}`" for l in links)
 
@@ -586,6 +601,7 @@ def _reseller_claim_reply(res: Dict[str, Any]) -> str:
         f"💳 Deducted: **{res['charged_display']}** | Wallet balance left: **{res['balance_display']}**\n\n"
         f"🔗 **Your Single-Use Invite Link(s):**\n{_fmt_links(res['links'])}\n\n"
         "⚠️ *Each link is permanently burned from stock and reserved for you alone.*"
+        + _verification_line(res)
     )
 
 
@@ -724,6 +740,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             f"📦 Product: **{res['product_name']}**\n💳 Payment ref: `{ref}`\n\n"
             f"🔗 **Your Single-Use Invite Link:**\n`{res['link']}`\n\n"
             "🔒 *Private single-use link - once activated it cannot be used again.*"
+            + _verification_line(res)
         )
 
     # 5. Customer naming a product -> create / reuse order

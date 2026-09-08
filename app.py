@@ -791,11 +791,13 @@ def recheck_inventory():
         if product_id and str(product_id).isdigit():
             q = q.filter(InviteLink.product_id == int(product_id))
         links = q.order_by(InviteLink.id.asc()).limit(300).all()
+        checkable = [lk for lk in links if is_checkable(lk.link_or_key)]
+        # The logged-in browser launches Chromium per link and shares an hourly budget with live
+        # sales, so bulk rechecks use the cheap HTTP probe; small runs (<= 5 links) may use the browser.
+        allow_browser = len(checkable) <= 5
         checked = fresh = used = restored = 0
-        for lk in links:
-            if not is_checkable(lk.link_or_key):
-                continue
-            h = check_link_freshness(lk.link_or_key)
+        for lk in checkable:
+            h = check_link_freshness(lk.link_or_key, allow_browser=allow_browser)
             lk.health = h
             lk.health_checked_at = utcnow()
             checked += 1
@@ -1118,6 +1120,8 @@ def update_system_settings_api():
         if "openai_model_name" in data:
             s.openai_model_name = str(data["openai_model_name"]).strip()[:50] or "gpt-4o-mini"
             llm_changed = True
+        if "google_checker_enabled" in data:
+            s.google_checker_enabled = bool(data["google_checker_enabled"])
         if "agent_instructions" in data:
             s.agent_instructions = str(data["agent_instructions"])[:8000]
             llm_changed = True  # trained instructions change the prompt -> rebuild agent
@@ -1127,6 +1131,107 @@ def update_system_settings_api():
         return jsonify(s.to_dict())
     finally:
         db.close()
+
+
+# =====================================================================
+# Admin: Google Link Checker (logged-in headless browser for Gemini links)
+# =====================================================================
+
+@app.route("/api/admin/google-checker/status", methods=["GET"])
+@require_admin
+def google_checker_status():
+    import google_checker
+    return jsonify(google_checker.checker_status())
+
+
+@app.route("/api/admin/google-checker/session", methods=["POST"])
+@require_admin
+@rate_limited(10, "gc_session")
+def google_checker_upload_session():
+    """
+    Connect the checker's Google account: accepts the google_session.json produced by
+    `python google_checker.py login`, or a cookie export (Cookie-Editor / EditThisCookie),
+    as JSON body {"session": <object or array>} or as the raw JSON itself.
+    The cookies are stored only on this server; they are never sent anywhere else.
+    """
+    import google_checker
+    data = request.get_json(silent=True)
+    if isinstance(data, dict) and "session" in data:
+        payload = data["session"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                return jsonify({"error": "session must be valid JSON"}), 400
+    else:
+        payload = data
+    if payload in (None, "", [], {}):
+        return jsonify({"error": "No session JSON provided"}), 400
+    try:
+        info = google_checker.save_session(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:   # browser lock busy
+        return jsonify({"error": str(exc)}), 503
+    # Verify immediately (opens one.google.com in the headless browser) when possible.
+    verification = None
+    if google_checker.playwright_installed():
+        try:
+            verification = google_checker.verify_session().as_dict()
+        except Exception as exc:  # noqa: BLE001
+            verification = {"status": "error", "reason": str(exc)[:200]}
+    return jsonify({"success": True, "saved": info, "verification": verification, "status": google_checker.checker_status()})
+
+
+@app.route("/api/admin/google-checker/session", methods=["DELETE"])
+@require_admin
+@rate_limited(10, "gc_session")
+def google_checker_disconnect():
+    import google_checker
+    try:
+        google_checker.clear_session()
+    except RuntimeError as exc:   # browser lock busy
+        return jsonify({"error": str(exc)}), 503
+    return jsonify({"success": True, "status": google_checker.checker_status()})
+
+
+@app.route("/api/admin/google-checker/verify", methods=["POST"])
+@require_admin
+@rate_limited(10, "gc_verify")
+def google_checker_verify():
+    import google_checker
+    if not google_checker.playwright_installed():
+        return jsonify({"error": "playwright is not installed on the server (pip install playwright && playwright install --with-deps chromium)"}), 400
+    return jsonify({"result": google_checker.verify_session().as_dict(), "status": google_checker.checker_status()})
+
+
+@app.route("/api/admin/google-checker/test", methods=["POST"])
+@require_admin
+@rate_limited(20, "gc_test")
+def google_checker_test_link():
+    """Check ONE link now (read-only) and show the verdict + evidence — for admin testing.
+    Only https links on Google's activation hosts are opened: the server-side browser must never
+    be pointed at internal services or arbitrary sites."""
+    import google_checker
+    url = str(_payload().get("url", "")).strip()
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    if not google_checker.is_allowed_url(url):
+        return jsonify({"error": "Sirf Google activation links check ho sakti hain: https://one.google.com/…, "
+                                 "https://serviceactivation.google.com/…, https://families.google.com/…"}), 400
+    if not google_checker.playwright_installed():
+        return jsonify({"error": "playwright is not installed on the server"}), 400
+    r = google_checker.check_link(url, force=True, probe=True)
+    return jsonify({"result": r.as_dict(), "status": google_checker.checker_status()})
+
+
+@app.route("/api/admin/google-checker/screenshot", methods=["GET"])
+@require_admin
+def google_checker_screenshot():
+    import google_checker
+    if not google_checker.LAST_SHOT.exists():
+        return jsonify({"error": "No screenshot yet"}), 404
+    return send_file(str(google_checker.LAST_SHOT), mimetype="image/png", max_age=0)
 
 
 # =====================================================================

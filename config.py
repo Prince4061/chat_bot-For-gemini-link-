@@ -66,6 +66,23 @@ class Config:
 
     # --- Business rules -----------------------------------------------------
     MAX_CLAIM_QUANTITY: int = _env_int("MAX_CLAIM_QUANTITY", 10)
+    # Used-link protection: Google can't be asked whether a Gemini link is consumed (login wall),
+    # so when a buyer reports "link used" we flag it and hand out a replacement for free.
+    # Logged-in headless-browser checker for Google One / Gemini links (see google_checker.py).
+    GOOGLE_CHECKER_DIR: Path = Path(os.getenv("GOOGLE_CHECKER_DIR") or (Path(os.getenv("AGENT_WORKSPACE_DIR") or (BASE_DIR / "agent_workspace")) / "google_checker"))
+    GOOGLE_CHECKER_MAX_PER_HOUR: int = _env_int("GOOGLE_CHECKER_MAX_PER_HOUR", 40)
+    GOOGLE_CHECKER_TIMEOUT_SECONDS: int = _env_int("GOOGLE_CHECKER_TIMEOUT_SECONDS", 20)
+    GOOGLE_CHECKER_CACHE_SECONDS: int = _env_int("GOOGLE_CHECKER_CACHE_SECONDS", 600)
+    GOOGLE_CHECKER_DOWN_COOLDOWN_SECONDS: int = _env_int("GOOGLE_CHECKER_DOWN_COOLDOWN_SECONDS", 600)
+    # Admin Test/Verify use their own hourly budget so they can never starve live sales of checks.
+    GOOGLE_CHECKER_PROBE_MAX_PER_HOUR: int = _env_int("GOOGLE_CHECKER_PROBE_MAX_PER_HOUR", 15)
+    # A sale waits at most this long for a busy browser, then hands the link out unverified.
+    GOOGLE_CHECKER_LOCK_WAIT_SECONDS: int = _env_int("GOOGLE_CHECKER_LOCK_WAIT_SECONDS", 8)
+    # Total wall-clock a single claim may spend verifying links (several used links in a row).
+    GOOGLE_CHECKER_CLAIM_BUDGET_SECONDS: int = _env_int("GOOGLE_CHECKER_CLAIM_BUDGET_SECONDS", 45)
+    AUTO_REPLACE_USED_LINKS: bool = _env_bool("AUTO_REPLACE_USED_LINKS", True)
+    REPLACEMENT_WINDOW_HOURS: int = _env_int("REPLACEMENT_WINDOW_HOURS", 72)   # after delivery
+    MAX_REPLACEMENTS_PER_LINK: int = _env_int("MAX_REPLACEMENTS_PER_LINK", 1)
     MAX_MESSAGE_LENGTH: int = _env_int("MAX_MESSAGE_LENGTH", 2000)
     RESELLER_MAX_FAILED_ATTEMPTS: int = _env_int("RESELLER_MAX_FAILED_ATTEMPTS", 5)
     RESELLER_LOCKOUT_MINUTES: int = _env_int("RESELLER_LOCKOUT_MINUTES", 15)
