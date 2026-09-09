@@ -110,6 +110,11 @@ class Product(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
 
+    # Auto-buy supplier: "stock" (local InviteLink inventory) | "moonshots" (buy on demand).
+    source = Column(String(20), default="stock")
+    supplier_product_id = Column(Integer, nullable=True)      # external product id at the supplier
+    supplier_max_price = Column(Float, nullable=True)         # safety cap (supplier currency, USD); skip auto-buy above it
+
     links = relationship("InviteLink", back_populates="product", cascade="all, delete-orphan")
 
     def get_customer_price(self) -> float:
@@ -148,8 +153,11 @@ class Product(Base):
             "reseller_price": self.get_reseller_price(),
             "reseller_price_set": self.reseller_price is not None,
             "is_active": self.is_active,
+            "source": self.source or "stock",
+            "supplier_product_id": self.supplier_product_id,
+            "supplier_max_price": self.supplier_max_price,
             "stock_count": stock,
-            "in_stock": stock > 0,
+            "in_stock": stock > 0 or (self.source == "moonshots"),
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -166,6 +174,7 @@ class InviteLink(Base):
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
     link_or_key = Column(Text, nullable=False)
     status = Column(String(20), default="available", index=True)  # available | claimed | used
+    source = Column(String(20), default="stock")          # stock | moonshots (auto-bought)
     # Freshness of the link itself (for auto-verifiable links like Gemini/Google One).
     health = Column(String(20), default="unchecked")     # unchecked | fresh | used | unknown
     health_checked_at = Column(DateTime, nullable=True)
@@ -416,6 +425,9 @@ class SystemSettings(Base):
     agent_instructions = Column(Text, default="")
     # Logged-in browser checker for Gemini links (google_checker.py) can be paused from the UI.
     google_checker_enabled = Column(Boolean, default=True)
+    # m00nshots supplier auto-buy: OFF by default. Key stored here (or MOONSHOTS_API_KEY env).
+    moonshots_api_key = Column(String(200), nullable=True)
+    moonshots_enabled = Column(Boolean, default=False)
 
     @staticmethod
     def _mask(value: Optional[str]) -> Optional[str]:
@@ -443,6 +455,9 @@ class SystemSettings(Base):
             "has_openai_key": bool(self.openai_api_key or Config.OPENAI_API_KEY),
             "agent_instructions": self.agent_instructions or "",
             "google_checker_enabled": True if self.google_checker_enabled is None else bool(self.google_checker_enabled),
+            "moonshots_enabled": bool(self.moonshots_enabled),
+            "moonshots_api_key": self._mask(self.moonshots_api_key),
+            "has_moonshots_key": bool(self.moonshots_api_key or Config.MOONSHOTS_API_KEY),
         }
 
 
@@ -968,6 +983,68 @@ def _claim_links_in_transaction(
     return db.query(InviteLink).filter(InviteLink.id.in_(claimed_ids)).order_by(InviteLink.id).all()
 
 
+def replenish_supplier_stock(db, product: "Product", needed: int) -> Dict[str, Any]:
+    """
+    For a supplier-backed product (source == "moonshots"): if local available stock is short of
+    `needed`, BUY the shortfall from the supplier now and insert the returned credentials as
+    normal available stock. Runs OUTSIDE the claim lock (network I/O) and commits on its own.
+
+    Returns {"bought": n, "order_code": str|None, "error": str|None}. Never raises: on any
+    supplier failure it logs and returns bought=0, so the caller falls back to the normal
+    out-of-stock handling and NO wallet is charged.
+    """
+    result: Dict[str, Any] = {"bought": 0, "order_code": None, "error": None}
+    if (getattr(product, "source", "stock") or "stock") != "moonshots":
+        return result
+    try:
+        import moonshots_service as ms
+    except Exception:  # noqa: BLE001
+        return result
+    if not ms.is_ready():
+        result["error"] = "supplier disabled or no API key"
+        return result
+    if not product.supplier_product_id:
+        result["error"] = "product not mapped to a supplier product"
+        return result
+
+    available = product.get_available_stock_count(db)
+    shortfall = int(needed) - int(available)
+    if shortfall <= 0:
+        return result
+    shortfall = min(shortfall, Config.MOONSHOTS_MAX_AUTOBUY_QTY)
+
+    try:
+        # Price-cap guard: never auto-buy if the supplier price exceeds the admin's ceiling.
+        if product.supplier_max_price is not None:
+            sup = ms.get_product(product.supplier_product_id)
+            unit = float(sup.get("price") or 0)
+            if unit > float(product.supplier_max_price):
+                result["error"] = f"supplier price {unit} above cap {product.supplier_max_price}"
+                logger.warning("Auto-buy skipped for %s: %s", product.slug, result["error"])
+                return result
+
+        order = ms.place_order(product.supplier_product_id, shortfall)
+        creds = order.get("credentials") or []
+        if not creds:
+            result["error"] = "supplier returned no credentials"
+            logger.error("Auto-buy for %s returned 0 credentials (order %s)", product.slug, order.get("order_code"))
+            return result
+        code = order.get("order_code")
+        for cred in creds:
+            db.add(InviteLink(product_id=product.id, link_or_key=str(cred), status="available",
+                              source="moonshots", notes=f"m00nshots {code}"))
+        db.commit()
+        result["bought"] = len(creds)
+        result["order_code"] = code
+        logger.info("Auto-bought %d unit(s) of %s from supplier (order %s)", len(creds), product.slug, code)
+    except Exception as exc:  # noqa: BLE001  (MoonshotsError or DB error)
+        db.rollback()
+        msg = getattr(exc, "message", str(exc))
+        result["error"] = msg
+        logger.exception("replenish_supplier_stock failed for %s: %s", product.slug, msg)
+    return result
+
+
 def ensure_fresh_stock(db, product_id: int, count: int = 1, max_checks: int = 12,
                        budget_seconds: Optional[float] = None) -> Dict[str, Any]:
     """
@@ -1110,6 +1187,9 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
     unit_charge = product_charge_for(db, reseller, product)     # in the reseller's currency
     total_charge = round(unit_charge * quantity, 2)
 
+    # Supplier auto-buy: top up stock from m00nshots on demand for supplier-backed products.
+    supplier_buy = replenish_supplier_stock(db, product, quantity)
+
     # Verify freshness lazily before claiming, so resellers only get fresh links.
     agg: Dict[str, Any] = {"checked": 0, "marked_used": 0, "method": "none"}
     try:
@@ -1196,6 +1276,7 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
             "currency": (reseller.currency or "INR").upper(),
             "links": [l.link_or_key for l in links],
             "link_verification": _link_verification(agg, links),
+            "supplier_autobuy": supplier_buy,
             "links_claimed_ids": [l.id for l in links],
             "reseller_name": reseller.name,
             "reseller_phone": reseller.phone,
@@ -1262,6 +1343,10 @@ def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "cust
             "error": "PAYMENT_REF_REUSED",
             "message": "This payment reference has already been used for another order. Please share the correct UTR.",
         }
+
+    # Supplier auto-buy: top up stock from m00nshots on demand for supplier-backed products.
+    if order.product:
+        replenish_supplier_stock(db, order.product, 1)
 
     # Verify freshness lazily before delivering, so customers only get fresh links.
     agg: Dict[str, Any] = {"checked": 0, "marked_used": 0, "method": "none"}

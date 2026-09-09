@@ -158,6 +158,10 @@ export const adminApi = {
     return URL.createObjectURL(res.data);
   },
 
+  // m00nshots supplier (auto-buy digital products on demand)
+  moonshotsStatus: async () => (await api.get('/admin/moonshots/status')).data,
+  moonshotsProducts: async (search = '') => (await api.get('/admin/moonshots/products', { params: search ? { search } : {} })).data,
+
   // Bot Tester (live chat with debug info)
   botTest: async (payload) => (await api.post('/admin/bot/test', payload)).data,
   botTestReset: async (sessionId) => (await api.post('/admin/bot/test/reset', { session_id: sessionId })).data,

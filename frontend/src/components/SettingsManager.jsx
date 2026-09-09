@@ -139,6 +139,45 @@ export default function SettingsManager() {
     catch (err) { alert('Error: ' + err.message); }
   };
 
+  // --- m00nshots supplier (auto-buy) ---
+  const [ms, setMs] = useState(null);            // supplier status {enabled, has_key, balance, ...}
+  const [msKey, setMsKey] = useState('');        // pasted API key
+  const [msBusy, setMsBusy] = useState('');
+  const [msMsg, setMsMsg] = useState(null);
+  const [msSearch, setMsSearch] = useState('');
+  const [msProducts, setMsProducts] = useState(null);
+
+  const loadMoonshots = async () => {
+    try { setMs(await adminApi.moonshotsStatus()); } catch (err) { console.error(err); }
+  };
+  useEffect(() => { loadMoonshots(); }, []);
+
+  const msSaveKey = async () => {
+    if (!msKey.trim()) return;
+    try {
+      setMsBusy('key'); setMsMsg(null);
+      const saved = await adminApi.updateSettings({ moonshots_api_key: msKey.trim() });
+      setSettings(saved); setMsKey('');
+      await loadMoonshots();
+      setMsMsg({ ok: true, text: 'API key saved.' });
+    } catch (err) { setMsMsg({ ok: false, text: 'Error: ' + err.message }); }
+    finally { setMsBusy(''); }
+  };
+
+  const msToggle = async (val) => {
+    try { const saved = await adminApi.updateSettings({ moonshots_enabled: val }); setSettings(saved); loadMoonshots(); }
+    catch (err) { alert('Error: ' + err.message); }
+  };
+
+  const msBrowse = async () => {
+    try {
+      setMsBusy('browse'); setMsMsg(null); setMsProducts(null);
+      const res = await adminApi.moonshotsProducts(msSearch.trim());
+      setMsProducts(res.data || []);
+    } catch (err) { setMsMsg({ ok: false, text: 'Error: ' + (err.response?.data?.error || err.message) }); }
+    finally { setMsBusy(''); }
+  };
+
   const handleTestLlm = async () => {
     try {
       setTesting(true);
@@ -423,6 +462,75 @@ export default function SettingsManager() {
                 </div>
               )}
             </div>
+          </div>
+        </div>
+
+        {/* m00nshots supplier — bot auto-buys a product on demand and delivers it */}
+        <div className="glass-panel rounded-2xl p-5 border border-white/10 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-[#ececec] flex items-center gap-2">
+              <DollarSign className="w-4 h-4 text-[#ececec]" />
+              m00nshots Auto-Buy Supplier
+            </h3>
+            {ms && (
+              <div className="flex items-center gap-2 text-[11px]">
+                <span className={`px-2 py-0.5 rounded-full border ${ms.has_key ? 'bg-[#2f2f2f] text-[#ececec] border-white/15' : 'bg-rose-950/40 text-rose-300 border-rose-500/30'}`}>
+                  {ms.has_key ? `Key ${ms.key_mask || 'set'}` : 'No API key'}
+                </span>
+                {ms.has_key && (
+                  <span className={`px-2 py-0.5 rounded-full border ${ms.error ? 'bg-rose-950/40 text-rose-300 border-rose-500/30' : 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30'}`}>
+                    {ms.error ? 'Error' : `Balance: ${ms.balance} ${ms.currency || 'USD'}`}
+                  </span>
+                )}
+                <label className="flex items-center gap-1 text-[#8e8ea0] cursor-pointer">
+                  <input type="checkbox" checked={settings.moonshots_enabled === true} onChange={(e) => msToggle(e.target.checked)} />
+                  enabled
+                </label>
+              </div>
+            )}
+          </div>
+
+          <p className="text-[11px] text-[#8e8ea0] leading-relaxed">
+            Jab kisi product ka source <b>m00nshots</b> ho aur stock khatam ho, bot khud supplier se
+            khareed ke user ko de deta hai. Yahan API key daalo (Telegram bot ka <code>/api</code> command),
+            enable karo, aur <b>Products</b> tab me product ko supplier ki ID se map karo.
+            {ms?.error && <span className="text-rose-300"> · {ms.error}</span>}
+          </p>
+
+          <div className="flex items-center gap-2">
+            <input type="password" value={msKey} onChange={(e) => setMsKey(e.target.value)}
+              placeholder={ms?.has_key ? 'Nayi key daalo (purani replace hogi)' : 'mk_...'}
+              className="flex-1 p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono text-[11px] focus:outline-none focus:border-white/20" />
+            <button type="button" onClick={msSaveKey} disabled={msBusy !== '' || !msKey.trim()}
+              className="px-3 py-2 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/15 text-[#ececec] rounded-xl disabled:opacity-50">
+              {msBusy === 'key' ? 'Saving…' : 'Save key'}
+            </button>
+            <button type="button" onClick={loadMoonshots} disabled={msBusy !== ''}
+              className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">Refresh</button>
+          </div>
+          {msMsg && <div className={`text-[11px] ${msMsg.ok ? 'text-emerald-300' : 'text-rose-300'}`}>{msMsg.text}</div>}
+
+          <div>
+            <label className="block text-[#8e8ea0] mb-1 font-medium text-[11px]">Supplier catalogue — product ki ID dhoondo (Products tab me map karne ke liye)</label>
+            <div className="flex items-center gap-2">
+              <input value={msSearch} onChange={(e) => setMsSearch(e.target.value)} placeholder="e.g. gemini"
+                className="flex-1 p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] text-[11px] focus:outline-none focus:border-white/20" />
+              <button type="button" onClick={msBrowse} disabled={msBusy !== '' || !ms?.has_key}
+                className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">
+                {msBusy === 'browse' ? 'Loading…' : 'Browse'}
+              </button>
+            </div>
+            {msProducts && (
+              <div className="mt-2 max-h-56 overflow-auto rounded-xl border border-white/10 divide-y divide-white/5">
+                {msProducts.length === 0 && <div className="p-2.5 text-[11px] text-[#8e8ea0]">Koi product nahi mila.</div>}
+                {msProducts.map((it) => (
+                  <div key={it.id} className="p-2.5 text-[11px] flex items-center justify-between gap-2">
+                    <span className="text-[#d4d4d4]">{it.icon} {it.name} <span className="text-[#8e8ea0]">· {it.category}</span></span>
+                    <span className="text-[#8e8ea0] whitespace-nowrap">ID <b className="text-[#ececec]">{it.id}</b> · ${it.price} · stock {it.stock}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 

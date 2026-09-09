@@ -97,6 +97,13 @@ class Config:
     CHAT_HISTORY_WINDOW: int = _env_int("CHAT_HISTORY_WINDOW", 20)
     AGENT_WORKSPACE_DIR: Path = Path(os.getenv("AGENT_WORKSPACE_DIR") or (BASE_DIR / "agent_workspace"))
 
+    # --- Supplier: m00nshots instant store (auto-buy digital products) ------
+    # The bot buys a product from this supplier on demand and delivers the returned credentials.
+    MOONSHOTS_API_URL: str = os.getenv("MOONSHOTS_API_URL", "https://instant.m00nshots.store/api/v1").strip()
+    MOONSHOTS_API_KEY: str = os.getenv("MOONSHOTS_API_KEY", "").strip()   # UI key overrides this
+    MOONSHOTS_TIMEOUT_SECONDS: int = _env_int("MOONSHOTS_TIMEOUT_SECONDS", 30)
+    MOONSHOTS_MAX_AUTOBUY_QTY: int = _env_int("MOONSHOTS_MAX_AUTOBUY_QTY", 10)
+
     # --- WhatsApp / Evolution -----------------------------------------------
     EVOLUTION_API_URL: str = os.getenv("EVOLUTION_API_URL", "http://localhost:8080").strip()
     EVOLUTION_API_KEY: str = os.getenv("EVOLUTION_API_KEY", "").strip()

@@ -572,6 +572,36 @@ def list_admin_products():
         db.close()
 
 
+def _apply_supplier_fields(product, data):
+    """Set product.source / supplier_product_id / supplier_max_price from a payload. Returns error str|None."""
+    if "source" in data:
+        src = str(data["source"]).strip().lower()
+        if src not in ("stock", "moonshots"):
+            return "source must be 'stock' or 'moonshots'"
+        product.source = src
+    if "supplier_product_id" in data:
+        v = data["supplier_product_id"]
+        if v in (None, ""):
+            product.supplier_product_id = None
+        else:
+            try:
+                product.supplier_product_id = int(v)
+            except (TypeError, ValueError):
+                return "supplier_product_id must be an integer"
+    if "supplier_max_price" in data:
+        v = data["supplier_max_price"]
+        if v in (None, ""):
+            product.supplier_max_price = None
+        else:
+            try:
+                product.supplier_max_price = max(0.0, float(v))
+            except (TypeError, ValueError):
+                return "supplier_max_price must be a number"
+    if (product.source or "stock") == "moonshots" and not product.supplier_product_id:
+        return "A m00nshots product needs a supplier_product_id"
+    return None
+
+
 @app.route("/api/admin/products", methods=["POST"])
 @require_admin
 def create_admin_product():
@@ -597,6 +627,9 @@ def create_admin_product():
             reseller_price=_reseller_price_from(data) if "reseller_margin_percent" not in data else None,
             is_active=bool(data.get("is_active", True)),
         )
+        supplier_err = _apply_supplier_fields(product, data)
+        if supplier_err:
+            return jsonify({"error": supplier_err}), 400
         db.add(product)
         db.commit()
         return jsonify(product.to_dict(db)), 201
@@ -628,6 +661,9 @@ def update_admin_product(prod_id):
         if "reseller_price" in data and "reseller_margin_percent" not in data:
             product.reseller_price = _reseller_price_from(data)
         if "is_active" in data: product.is_active = bool(data["is_active"])
+        supplier_err = _apply_supplier_fields(product, data)
+        if supplier_err:
+            return jsonify({"error": supplier_err}), 400
         db.commit()
         return jsonify(product.to_dict(db))
     finally:
@@ -1122,6 +1158,10 @@ def update_system_settings_api():
             llm_changed = True
         if "google_checker_enabled" in data:
             s.google_checker_enabled = bool(data["google_checker_enabled"])
+        if "moonshots_enabled" in data:
+            s.moonshots_enabled = bool(data["moonshots_enabled"])
+        if "moonshots_api_key" in data and not _is_masked(data["moonshots_api_key"]):
+            s.moonshots_api_key = str(data["moonshots_api_key"]).strip()[:200] or None
         if "agent_instructions" in data:
             s.agent_instructions = str(data["agent_instructions"])[:8000]
             llm_changed = True  # trained instructions change the prompt -> rebuild agent
@@ -1232,6 +1272,33 @@ def google_checker_screenshot():
     if not google_checker.LAST_SHOT.exists():
         return jsonify({"error": "No screenshot yet"}), 404
     return send_file(str(google_checker.LAST_SHOT), mimetype="image/png", max_age=0)
+
+
+# =====================================================================
+# Admin: m00nshots supplier (auto-buy digital products)
+# =====================================================================
+
+@app.route("/api/admin/moonshots/status", methods=["GET"])
+@require_admin
+def moonshots_status():
+    import moonshots_service as ms
+    return jsonify(ms.status_dict())
+
+
+@app.route("/api/admin/moonshots/products", methods=["GET"])
+@require_admin
+@rate_limited(30, "ms_products")
+def moonshots_products():
+    """Browse the supplier catalogue so the admin can map a local product to a supplier product."""
+    import moonshots_service as ms
+    search = str(request.args.get("search", "")).strip()
+    in_stock = request.args.get("in_stock")
+    in_stock_bool = None if in_stock is None else str(in_stock).lower() in ("1", "true", "yes")
+    try:
+        items = ms.list_products(search=search, in_stock=in_stock_bool)
+    except ms.MoonshotsError as exc:
+        return jsonify({"error": exc.message, "code": exc.code}), 502
+    return jsonify({"success": True, "count": len(items), "data": items})
 
 
 # =====================================================================

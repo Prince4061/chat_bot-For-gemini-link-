@@ -60,6 +60,30 @@ export default function ProductManager() {
     }));
   };
 
+  const handleSupplierChange = (id, field, value) => {
+    setProducts(products.map(p => (p.id === id ? { ...p, [field]: value } : p)));
+  };
+
+  const handleSaveSupplier = async (p) => {
+    try {
+      setSavingMarginId(p.id);
+      await adminApi.updateProduct(p.id, {
+        source: p.source || 'stock',
+        supplier_product_id: p.supplier_product_id === '' ? null : p.supplier_product_id,
+        supplier_max_price: p.supplier_max_price === '' ? null : p.supplier_max_price,
+      });
+      setSuccessMsg((p.source === 'moonshots')
+        ? `Auto-buy ON: stock khatam hone par bot m00nshots product #${p.supplier_product_id} khud khareed ke dega.`
+        : 'Source set to local stock.');
+      setTimeout(() => setSuccessMsg(''), 4000);
+      loadProducts();
+    } catch (err) {
+      alert('Failed to save supplier settings: ' + (err.response?.data?.error || err.message));
+    } finally {
+      setSavingMarginId(null);
+    }
+  };
+
   const handleSaveMargin = async (p) => {
     try {
       setSavingMarginId(p.id);
@@ -244,6 +268,50 @@ export default function ProductManager() {
                       <span className="text-sm font-bold text-sky-300">₹{Number(p.reseller_price).toFixed(2)}</span>
                     </div>
                   </div>
+                </div>
+                {/* Auto-buy supplier source */}
+                <div className="p-3 bg-[#2f2f2f] rounded-xl border border-white/10 mt-3 space-y-2">
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-[#ececec] font-medium">Stock source</span>
+                    <select
+                      value={p.source || 'stock'}
+                      onChange={(e) => handleSupplierChange(p.id, 'source', e.target.value)}
+                      className="py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-xs text-[#ececec] focus:outline-none"
+                    >
+                      <option value="stock">Local stock</option>
+                      <option value="moonshots">m00nshots auto-buy</option>
+                    </select>
+                  </div>
+                  {(p.source || 'stock') === 'moonshots' && (
+                    <div className="space-y-2">
+                      <div className="flex justify-between items-center text-xs gap-2">
+                        <span className="text-[#8e8ea0] whitespace-nowrap" title="Supplier catalogue me product ki ID (Settings → m00nshots → Browse)">Supplier product ID</span>
+                        <input
+                          type="number" min="1" placeholder="e.g. 42"
+                          value={p.supplier_product_id ?? ''}
+                          onChange={(e) => handleSupplierChange(p.id, 'supplier_product_id', e.target.value)}
+                          className="w-24 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] focus:outline-none"
+                        />
+                      </div>
+                      <div className="flex justify-between items-center text-xs gap-2">
+                        <span className="text-[#8e8ea0] whitespace-nowrap" title="Is price se upar supplier ho to auto-buy nahi hoga (USD). Khaali = no cap">Max buy price ($)</span>
+                        <input
+                          type="number" min="0" step="0.01" placeholder="optional"
+                          value={p.supplier_max_price ?? ''}
+                          onChange={(e) => handleSupplierChange(p.id, 'supplier_max_price', e.target.value)}
+                          className="w-24 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] focus:outline-none"
+                        />
+                      </div>
+                      <p className="text-[10px] text-[#8e8ea0] leading-snug">Stock khatam hone par bot supplier se khud khareed ke user ko dega. Settings me API key + enable zaroori hai.</p>
+                    </div>
+                  )}
+                  <button
+                    onClick={() => handleSaveSupplier(p)}
+                    disabled={savingMarginId === p.id}
+                    className="w-full py-1.5 bg-[#3a3a3a] hover:bg-[#4a4a4a] disabled:opacity-50 text-[#d4d4d4] font-semibold text-[11px] rounded-lg transition-all"
+                  >
+                    Save source
+                  </button>
                 </div>
               </div>
 
