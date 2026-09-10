@@ -1301,6 +1301,51 @@ def moonshots_products():
     return jsonify({"success": True, "count": len(items), "data": items})
 
 
+@app.route("/api/admin/moonshots/products/<int:supplier_pid>", methods=["GET"])
+@require_admin
+@rate_limited(60, "ms_product")
+def moonshots_product_one(supplier_pid):
+    """Live name/price/stock of ONE supplier product (used while the admin types a supplier id)."""
+    import moonshots_service as ms
+    db = get_db()
+    try:
+        rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+    finally:
+        db.close()
+    fresh = str(request.args.get("fresh", "")).lower() in ("1", "true")
+    info = ms.product_summary(supplier_pid, rate, max_age=0 if fresh else ms.PRODUCT_CACHE_SECONDS)
+    return jsonify({"success": info.get("error") is None, "data": info, "usd_to_inr_rate": rate})
+
+
+@app.route("/api/admin/moonshots/mapped", methods=["GET"])
+@require_admin
+@rate_limited(30, "ms_mapped")
+def moonshots_mapped():
+    """Live supplier info for every local product mapped to m00nshots, keyed by local product id.
+    One call for the whole Products tab; results are cached ~60 s server-side."""
+    import moonshots_service as ms
+    db = get_db()
+    try:
+        rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+        mapped = (db.query(Product.id, Product.supplier_product_id)
+                  .filter(Product.source == "moonshots", Product.supplier_product_id.isnot(None)).all())
+    finally:
+        db.close()
+    fresh = str(request.args.get("fresh", "")).lower() in ("1", "true")
+    max_age = 0 if fresh else ms.PRODUCT_CACHE_SECONDS
+    items = {}
+    if mapped and not ms.api_key():
+        for local_id, _sid in mapped:
+            items[str(local_id)] = {"error": "Supplier API key not configured (Settings -> m00nshots)", "code": "no_key"}
+    else:
+        seen: dict = {}
+        for local_id, sid in mapped:
+            if sid not in seen:                       # several local products may share one supplier id
+                seen[sid] = ms.product_summary(sid, rate, max_age=max_age)
+            items[str(local_id)] = seen[sid]
+    return jsonify({"success": True, "usd_to_inr_rate": rate, "count": len(items), "items": items})
+
+
 # =====================================================================
 # Admin: Bot Tester (live chat with debug info)
 # =====================================================================

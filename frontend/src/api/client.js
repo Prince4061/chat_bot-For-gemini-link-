@@ -161,6 +161,8 @@ export const adminApi = {
   // m00nshots supplier (auto-buy digital products on demand)
   moonshotsStatus: async () => (await api.get('/admin/moonshots/status')).data,
   moonshotsProducts: async (search = '') => (await api.get('/admin/moonshots/products', { params: search ? { search } : {} })).data,
+  moonshotsProduct: async (supplierId, fresh = false) => (await api.get(`/admin/moonshots/products/${supplierId}`, { params: fresh ? { fresh: 1 } : {} })).data,
+  moonshotsMapped: async (fresh = false) => (await api.get('/admin/moonshots/mapped', { params: fresh ? { fresh: 1 } : {} })).data,
 
   // Bot Tester (live chat with debug info)
   botTest: async (payload) => (await api.post('/admin/bot/test', payload)).data,

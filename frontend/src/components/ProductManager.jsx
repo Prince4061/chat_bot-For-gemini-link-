@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Package, 
   Plus, 
@@ -32,11 +32,47 @@ export default function ProductManager() {
 
   const priceWithMargin = (base, pct) => Math.round((base + (base * (parseFloat(pct) || 0) / 100)) * 100) / 100;
 
+  // Live m00nshots info (name / $ price / ≈₹ / stock) per LOCAL product id, so the admin never has
+  // to open Browse to see what the supplier currently charges.
+  const [supInfo, setSupInfo] = useState({});
+  const [supLoading, setSupLoading] = useState(false);
+  const supTimers = useRef({});
+
+  const loadSupplierInfo = async (fresh = false) => {
+    try {
+      setSupLoading(true);
+      const res = await adminApi.moonshotsMapped(fresh);
+      setSupInfo(prev => ({ ...prev, ...(res.items || {}) }));
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setSupLoading(false);
+    }
+  };
+
+  // Called (debounced) while the admin types a supplier id, so the card shows that id's live price
+  // before they even press "Save source".
+  const fetchSupplierInfoFor = (localId, supplierId, fresh = false) => {
+    clearTimeout(supTimers.current[localId]);
+    const sid = parseInt(supplierId, 10);
+    if (!sid) { setSupInfo(prev => ({ ...prev, [localId]: null })); return; }
+    supTimers.current[localId] = setTimeout(async () => {
+      setSupInfo(prev => ({ ...prev, [localId]: { loading: true } }));
+      try {
+        const res = await adminApi.moonshotsProduct(sid, fresh);
+        setSupInfo(prev => ({ ...prev, [localId]: res.data }));
+      } catch (err) {
+        setSupInfo(prev => ({ ...prev, [localId]: { error: err.response?.data?.error || err.message } }));
+      }
+    }, fresh ? 0 : 600);
+  };
+
   const loadProducts = async () => {
     try {
       setLoading(true);
       const data = await adminApi.getProducts();
       setProducts(data);
+      if (data.some(p => p.source === 'moonshots' && p.supplier_product_id)) loadSupplierInfo();
     } catch (err) {
       console.error(err);
     } finally {
@@ -62,6 +98,11 @@ export default function ProductManager() {
 
   const handleSupplierChange = (id, field, value) => {
     setProducts(products.map(p => (p.id === id ? { ...p, [field]: value } : p)));
+    if (field === 'supplier_product_id') fetchSupplierInfoFor(id, value);
+    if (field === 'source' && value === 'moonshots') {
+      const cur = products.find(p => p.id === id);
+      if (cur?.supplier_product_id) fetchSupplierInfoFor(id, cur.supplier_product_id);
+    }
   };
 
   const handleSaveSupplier = async (p) => {
@@ -302,6 +343,46 @@ export default function ProductManager() {
                           className="w-24 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] focus:outline-none"
                         />
                       </div>
+                      {/* Live supplier info for the mapped id — no need to open Browse */}
+                      {p.supplier_product_id && (() => {
+                        const info = supInfo[p.id];
+                        const rupee = info && !info.error && !info.loading ? Number(info.price_inr || 0) : null;
+                        const losing = rupee !== null && rupee > Number(p.base_price || 0);
+                        return (
+                          <div className="rounded-lg bg-[#212121] border border-white/10 p-2 text-[11px] space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[#8e8ea0]">m00nshots live</span>
+                              <button type="button" title="Abhi refresh karo"
+                                onClick={() => fetchSupplierInfoFor(p.id, p.supplier_product_id, true)}
+                                className="text-[#8e8ea0] hover:text-[#ececec] px-1 rounded">
+                                <RefreshCw className={`w-3 h-3 ${info?.loading ? 'animate-spin' : ''}`} />
+                              </button>
+                            </div>
+                            {!info || info.loading ? (
+                              <div className="text-[#8e8ea0]">Price load ho raha hai…</div>
+                            ) : info.error ? (
+                              <div className="text-rose-300 break-words">{info.error}</div>
+                            ) : (
+                              <>
+                                <div className="text-[#ececec] font-semibold truncate" title={info.name}>{info.icon} {info.name}</div>
+                                <div className="flex justify-between items-center">
+                                  <span className="text-[#8e8ea0]">Supplier price</span>
+                                  <span className="font-bold text-emerald-300">${Number(info.price).toFixed(2)}
+                                    <span className="text-[#8e8ea0] font-normal"> ≈ ₹{rupee.toFixed(0)}</span>
+                                  </span>
+                                </div>
+                                <div className="flex justify-between items-center">
+                                  <span className="text-[#8e8ea0]">Supplier stock</span>
+                                  <span className={info.in_stock ? 'text-[#d4d4d4]' : 'text-rose-300'}>{info.in_stock ? info.stock : 'out of stock'}</span>
+                                </div>
+                                {losing && (
+                                  <div className="text-amber-300 leading-snug">⚠ Supplier price (₹{rupee.toFixed(0)}) aapke base price (₹{Number(p.base_price).toFixed(0)}) se zyada — base price badhao warna nuksan.</div>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        );
+                      })()}
                       <p className="text-[10px] text-[#8e8ea0] leading-snug">Stock khatam hone par bot supplier se khud khareed ke user ko dega. Settings me API key + enable zaroori hai.</p>
                     </div>
                   )}

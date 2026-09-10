@@ -125,6 +125,43 @@ def get_product(supplier_product_id: int) -> Dict[str, Any]:
     return _request("GET", f"/products/{int(supplier_product_id)}").get("data", {})
 
 
+_PRODUCT_CACHE: Dict[int, Dict[str, Any]] = {}   # supplier_product_id -> {"ts": float, "data": {...}}
+PRODUCT_CACHE_SECONDS = 60
+
+
+def get_product_cached(supplier_product_id: int, max_age: int = PRODUCT_CACHE_SECONDS) -> Dict[str, Any]:
+    """Supplier product with a short cache so the Products tab can show live prices for many
+    mapped products without burning the supplier's 120 req/min budget."""
+    import time
+    pid = int(supplier_product_id)
+    hit = _PRODUCT_CACHE.get(pid)
+    if hit and time.time() - hit["ts"] < max_age:
+        return hit["data"]
+    data = get_product(pid)
+    _PRODUCT_CACHE[pid] = {"ts": time.time(), "data": data}
+    return data
+
+
+def product_summary(supplier_product_id: int, usd_to_inr: float, max_age: int = PRODUCT_CACHE_SECONDS) -> Dict[str, Any]:
+    """Compact live view for the admin UI: name, $ price, ≈ ₹ price, stock. Errors are per-item."""
+    try:
+        d = get_product_cached(supplier_product_id, max_age=max_age)
+        price = float(d.get("price") or 0)
+        return {
+            "supplier_product_id": int(supplier_product_id),
+            "name": d.get("name"), "icon": d.get("icon"), "category": d.get("category"),
+            "price": price, "currency": (d.get("currency") or "USD").upper(),
+            "price_inr": round(price * float(usd_to_inr or 0), 2),
+            "stock": d.get("stock"), "in_stock": bool(d.get("in_stock", (d.get("stock") or 0) > 0)),
+            "min_qty": d.get("min_qty"), "max_qty": d.get("max_qty"), "warranty_days": d.get("warranty_days"),
+            "error": None,
+        }
+    except MoonshotsError as exc:
+        return {"supplier_product_id": int(supplier_product_id), "error": exc.message, "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"supplier_product_id": int(supplier_product_id), "error": f"{type(exc).__name__}", "code": "error"}
+
+
 # --- the purchase ----------------------------------------------------------------------------
 
 def place_order(supplier_product_id: int, quantity: int = 1) -> Dict[str, Any]:
