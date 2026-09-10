@@ -168,12 +168,14 @@ export const adminApi = {
   botTest: async (payload) => (await api.post('/admin/bot/test', payload)).data,
   botTestReset: async (sessionId) => (await api.post('/admin/bot/test/reset', { session_id: sessionId })).data,
 
+  agentStatus: async () => (await api.get('/admin/agent/status')).data,
+
   // AI training (Knowledge Base / FAQ)
   getKnowledge: async () => (await api.get('/admin/knowledge')).data,
   createKnowledge: async (entry) => (await api.post('/admin/knowledge', entry)).data,
   updateKnowledge: async (id, entry) => (await api.put(`/admin/knowledge/${id}`, entry)).data,
   deleteKnowledge: async (id) => (await api.delete(`/admin/knowledge/${id}`)).data,
-  testKnowledge: async (question) => (await api.post('/admin/knowledge/test', { question })).data,
+  testKnowledge: async (question, platform = 'web') => (await api.post('/admin/knowledge/test', { question, platform })).data,
 
   simulateEvolutionWhatsApp: async (phone, message, name = 'WhatsApp User') =>
     (await api.post('/webhook/simulate', { phone, message, name })).data

@@ -41,6 +41,9 @@ from database import (
     find_reseller_by_phone,
     get_active_knowledge,
     match_knowledge,
+    match_knowledge_detail,
+    render_knowledge_answer,
+    product_is_orderable,
     product_charge_for,
     stock_counts_by_product,
     process_reseller_claim_for,
@@ -428,7 +431,14 @@ def run_deep_agent_chat(
                     _r = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
                     if _r and _r.is_active and not _r.is_locked():
                         fact_reply = _verified_reseller_fact_reply(db, _r, user_message)
-                agent = None if fact_reply else get_deep_agent()
+                # Trained answers: a confident match is answered EXACTLY as the admin trained it, on both
+                # engines (weak matches still go to the LLM, which has the whole FAQ in its prompt).
+                kb_first = None
+                if not fact_reply:
+                    _dec = knowledge_decision(db, user_message, session_rec)
+                    if _dec["decision"] == "kb" and _dec["match"]["strong"]:
+                        kb_first = _dec["match"]
+                agent = None if (fact_reply or kb_first) else get_deep_agent()
                 if agent is not None:
                     engine = "deep_agent"
                     context_text = build_session_context_text(db, session_rec)
@@ -475,6 +485,9 @@ def run_deep_agent_chat(
                         else:
                             engine = "rule_based_fallback"
                             response_text = handle_rule_based_fallback(user_message, session_rec, db)
+                elif kb_first is not None:
+                    engine = "knowledge_base"
+                    response_text = _kb_answer(db, kb_first)
                 else:
                     response_text = handle_rule_based_fallback(user_message, session_rec, db)
             finally:
@@ -622,6 +635,51 @@ def _reseller_claim_reply(res: Dict[str, Any]) -> str:
     )
 
 
+# Words that mean "give me the product now" (vs. asking ABOUT a product: "gemini kaise activate kare").
+_CLAIM_INTENT_RE = re.compile(
+    r"\b(do|dedo|de do|dena|chahiye|chaiye|chahiy|bhejo|bhej|send|give|claim|buy|kharid|lena|lelo|le lo|order|"
+    r"links?|keys?|credentials?|account|activate karo|mangta|mangti|chahta|chahti|want|need)\b"
+)
+_UTR_RE = re.compile(r"(?<!\d)(\d{12})(?!\d)")
+
+
+def knowledge_decision(db, user_message: str, session_rec: Optional[ChatSessionRecord] = None) -> Dict[str, Any]:
+    """
+    Decide whether a trained answer should be used for this message and WHEN:
+      "kb"          -> answer from the knowledge base now (before the built-in flows)
+      "kb_fallback" -> weak match: only if no built-in flow handles the message
+      "builtin"     -> transactional message (UTR / phone+code / clear product claim): never hijack
+      "none"        -> nothing trained matches
+    Same logic drives the rule engine, the pre-LLM fast path and the admin Test box, so what the
+    admin sees in "Test" is exactly what the bot does.
+    """
+    msg = (user_message or "").strip()
+    low = msg.lower()
+    match = match_knowledge_detail(db, msg)
+    if not match:
+        return {"decision": "none", "reason": "Koi trained answer match nahi hua", "match": None}
+    # Transactional guards — money/links must never be intercepted by an FAQ.
+    if _UTR_RE.search(msg):
+        return {"decision": "builtin", "reason": "12-digit UTR hai -> payment flow", "match": match}
+    is_wa = bool(session_rec and session_rec.platform == "whatsapp")
+    if not is_wa and re.search(r"(?<!\d)\d{10}(?!\d)", msg) and re.search(r"(?<!\d)\d{4}(?!\d)", msg):
+        return {"decision": "builtin", "reason": "phone + 4-digit code -> reseller verification", "match": match}
+    product = find_product(db, msg)
+    verified_reseller = bool(session_rec and session_rec.reseller_id)
+    if product and verified_reseller and _CLAIM_INTENT_RE.search(low) and not match["strong"]:
+        return {"decision": "builtin", "reason": f"verified reseller + '{product.name}' + claim word -> link claim", "match": match}
+    if match["strong"] or not product:
+        why = ("strong match (phrase / 2+ keywords)" if match["strong"] else "match, koi product naam nahi")
+        return {"decision": "kb", "reason": why, "match": match}
+    return {"decision": "kb_fallback", "reason": f"weak match + product '{product.name}' named -> product flow pehle", "match": match}
+
+
+def _kb_answer(db, match: Dict[str, Any]) -> str:
+    entry = match["entry"]
+    record_tool_call("knowledge_base", True, f"#{entry.id} {entry.question[:60]} [{', '.join(match['matched'][:4])}]")
+    return render_knowledge_answer(entry.answer, get_settings(db))
+
+
 def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord, db) -> str:
     """
     Keyword/regex engine covering the core flows in Hindi, English and Hinglish.
@@ -683,6 +741,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         )
 
     # 2. Already-verified reseller (web-verified or WhatsApp auto-verified by number)
+    kb_dec = knowledge_decision(db, user_message, session_rec)
     if session_rec.reseller_id:
         reseller = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
         if reseller and reseller.is_active:
@@ -692,19 +751,34 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             fact = _verified_reseller_fact_reply(db, reseller, user_message)
             if fact:
                 return fact
-            if product and not any(k in msg for k in _CATALOG_KEYWORDS):
-                return _reseller_claim_reply(process_reseller_claim_for(reseller, product, quantity, db))
+            if product and not any(k in msg for k in _CATALOG_KEYWORDS) and kb_dec["decision"] != "kb":
+                # Claim only on clear intent ("gemini link do", "2 gemini", "gemini") — a QUESTION about
+                # the product ("gemini kaise activate kare") must never burn a link.
+                short = len(re.findall(r"[a-z0-9\u0900-\u097f]+", msg)) <= 3
+                if _CLAIM_INTENT_RE.search(msg) or short:
+                    return _reseller_claim_reply(process_reseller_claim_for(reseller, product, quantity, db))
+                return (
+                    f"💰 **{product.name}** — aapka reseller price **{reseller.money(product_charge_for(db, reseller, product))}** per link.\n"
+                    f"Wallet: **{reseller.money()}**\n\n"
+                    f"Link chahiye to bolo: *'{product.name.split(' (')[0]} link do'* (ya *'2 {product.name.split(' (')[0]} links'*)."
+                )
+
+    # 2b. Trained answer wins over the generic flows when it matches confidently (or when no
+    #     product is named) — but never over a UTR / phone+code / clear reseller claim (see above).
+    if kb_dec["decision"] == "kb":
+        return _kb_answer(db, kb_dec["match"])
 
     # 3. Catalogue (or a single product's price card when one is named)
     if any(k in msg for k in _CATALOG_KEYWORDS):
         named = find_product(db, user_message)
         if named and not any(k in msg for k in ("list", "catalog", "catalogue", "menu", "sab", "all", "products")):
             stock = named.get_available_stock_count(db)
+            stock_line = ('✅ ' + str(stock) + ' available') if stock else ('✅ available (on demand)' if product_is_orderable(db, named) else '❌ Out of stock')
             return (
                 f"💰 **{named.name}**\n\n"
                 f"• Customer price: **₹{named.get_customer_price():,.2f}**\n"
                 f"• Reseller price: **₹{named.get_reseller_price():,.2f}** (wallet se katta hai)\n"
-                f"• Stock: {'✅ ' + str(stock) + ' available' if stock else '❌ Out of stock'}\n"
+                f"• Stock: {stock_line}\n"
                 f"• {named.description}\n\n"
                 f"Reply *'buy {named.name.split(' (')[0]}'* to order, or send your reseller phone + 4-digit code to claim."
             )
@@ -733,7 +807,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         out = title + "\n\n"
         for p in products:
             stock = stock_map.get(p.id, 0)
-            badge = f"✅ {stock} in stock" if stock > 0 else "❌ Out of stock"
+            badge = f"✅ {stock} in stock" if stock > 0 else ("✅ available" if product_is_orderable(db, p) else "❌ Out of stock")
             out += f"• **{p.name}** — ₹{p.get_customer_price():,.2f} · reseller ₹{p.get_reseller_price():,.0f} · {badge}\n"
         if shown_total > len(products):
             out += f"\n…aur {shown_total - len(products)} products hain. Brand/naam bhejo (jaise *'notion'*, *'canva pro'*) to exact product dikhaunga.\n"
@@ -763,7 +837,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
     # 5. Customer naming a product -> create / reuse order
     product = find_product(db, user_message)
     if product:
-        if product.get_available_stock_count(db) < 1:
+        if not product_is_orderable(db, product):
             return f"❌ **{product.name}** is currently out of stock. Ask me for the catalogue to see what's available."
         order = get_pending_order_for_session(db, session_id)
         if not order or order.product_id != product.id:
@@ -793,10 +867,8 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
 
     # 5b. Admin-trained FAQ / knowledge base (answers general questions the flows above
     #     didn't handle — refund/delivery/how-to-pay/etc., trained from the admin panel).
-    kb = match_knowledge(db, user_message)
-    if kb:
-        record_tool_call("knowledge_base", True, f"#{kb.id} {kb.question}")  # visible in Bot Tester / metadata
-        return kb.answer
+    if kb_dec["decision"] in ("kb", "kb_fallback"):
+        return _kb_answer(db, kb_dec["match"])
 
     # 6. Greeting / help (platform-aware)
     if is_whatsapp:
@@ -805,7 +877,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         top = db.query(Product).filter(Product.is_active == True).order_by(Product.id).limit(8).all()  # noqa: E712
         total = db.query(Product).filter(Product.is_active == True).count()  # noqa: E712
         stock_map = stock_counts_by_product(db, [p.id for p in top])
-        lines = [f"• {p.name.split(' (')[0]} — ₹{p.get_customer_price():,.0f}" + ("" if stock_map.get(p.id, 0) else " (out of stock)") for p in top]
+        lines = [f"• {p.name.split(' (')[0]} — ₹{p.get_customer_price():,.0f}" + ("" if (stock_map.get(p.id, 0) or product_is_orderable(db, p)) else " (out of stock)") for p in top]
         more = f"\n…aur {total - len(top)} products. Naam bhejo to details dunga." if total > len(top) else ""
         return (
             f"👋 Namaste! **{settings.business_name}** me swagat hai.\n\n"

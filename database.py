@@ -609,7 +609,11 @@ def get_settings(db=None) -> SystemSettings:
 _STOPWORDS = {
     "the", "and", "for", "you", "your", "kya", "hai", "hain", "kaise", "kaisa", "mera", "meri",
     "main", "mujhe", "aap", "how", "what", "when", "where", "can", "please", "will", "with",
-    "about", "koi", "hoga", "karo", "karna", "chahiye", "chahta", "batao", "bata",
+    "about", "koi", "hoga", "hogi", "karo", "karna", "kare", "karu", "karun", "chahiye", "chahta",
+    "batao", "bata", "bhai", "sir", "plz", "milega", "milegi", "hota", "hoti", "wala", "wali",
+    "liye", "mein", "nahi", "haan", "yeh", "woh", "iska", "uska", "kitna", "kitni", "kitne",
+    "kaun", "kahan", "kab", "toh", "this", "that", "does", "there", "have", "want", "need",
+    "mujhko", "hamko", "humko", "apna", "apni", "kuch", "kyu", "kyun", "kyon", "matlab",
 }
 
 
@@ -623,35 +627,117 @@ def get_active_knowledge(db, limit: int = 200) -> List["KnowledgeEntry"]:
     )
 
 
-def match_knowledge(db, message: str) -> Optional["KnowledgeEntry"]:
+def _kb_tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9\u0900-\u097f]+", (text or "").lower())
+
+
+def _kb_derived_keywords(entry: "KnowledgeEntry") -> List[str]:
+    """When the admin gave no keywords, use the significant words of the example question(s).
+    The question field may hold several phrasings separated by newlines or ' | '."""
+    words: List[str] = []
+    for variant in re.split(r"\n+|\s\|\s", entry.question or ""):
+        for w in _kb_tokens(variant):
+            if len(w) >= 4 and w not in _STOPWORDS and w not in words:
+                words.append(w)
+    return words
+
+
+def _kb_word_hit(kw: str, text: str, tokens: List[str]) -> Optional[str]:
+    """How a single-word keyword matches the message: exact | prefix | fuzzy | None."""
+    if re.search(rf"(?<![\w\u0900-\u097f]){re.escape(kw)}(?![\w\u0900-\u097f])", text):
+        return "exact"
+    if len(kw) >= 4 and re.search(rf"(?<![\w\u0900-\u097f]){re.escape(kw)}[\w\u0900-\u097f]{{1,4}}", text):
+        return "prefix"                       # refund -> refunds / refunded, deliver -> delivery
+    if len(kw) >= 5:
+        import difflib
+        for tok in tokens:
+            if len(tok) >= 5 and abs(len(tok) - len(kw)) <= 2 and difflib.SequenceMatcher(None, kw, tok).ratio() >= 0.86:
+                return "fuzzy"                # delivry ~ delivery, refnd ~ refund
+    return None
+
+
+def match_knowledge_detail(db, message: str) -> Optional[Dict[str, Any]]:
     """
-    Return the best-matching active knowledge entry for a user message, or None.
-    Matches on admin keywords first; falls back to significant words of the question.
-    Requires at least one solid keyword hit so it never hijacks unrelated messages.
+    Best-matching active knowledge entry for a user message with HOW it matched:
+      {"entry", "score", "matched": ["kitni der (phrase)", "refund (prefix)"], "strong": bool}
+    Scoring: phrase keyword (has a space) found in the message = 2; single word exact/prefix/typo
+    match = 1. `strong` = a phrase hit or >= 2 keyword hits — confident enough to answer even when
+    the message also names a product ("gemini kaise activate kare").
+    Requires at least one hit so it never hijacks unrelated messages. Ties -> higher priority wins.
     """
-    text = (message or "").lower()
-    if not text.strip():
+    text = re.sub(r"\s+", " ", (message or "").lower()).strip()
+    if not text:
         return None
-    best, best_score = None, 0
+    tokens = _kb_tokens(text)
+    best: Optional[Dict[str, Any]] = None
     for entry in get_active_knowledge(db):
-        kws = entry.keyword_list()
-        if not kws:
-            # derive keywords from the question itself
-            kws = [w for w in re.findall(r"[a-z0-9]+", (entry.question or "").lower())
-                   if len(w) >= 4 and w not in _STOPWORDS]
-        score = 0
+        kws = entry.keyword_list() or _kb_derived_keywords(entry)
+        score, matched, phrase_hit = 0, [], False
         for kw in kws:
+            kw = re.sub(r"\s+", " ", kw).strip()
             if not kw:
                 continue
-            # phrase keyword (has space) -> substring; single word -> word-boundary match
             if " " in kw:
                 if kw in text:
-                    score += 2
-            elif re.search(rf"\b{re.escape(kw)}\b", text):
-                score += 1
-        if score > best_score:
-            best, best_score = entry, score
-    return best if best_score >= 1 else None
+                    score += 2; matched.append(f"{kw} (phrase)"); phrase_hit = True
+                continue
+            how = _kb_word_hit(kw, text, tokens)
+            if how:
+                score += 1; matched.append(f"{kw} ({how})" if how != "exact" else kw)
+        if score > 0 and (best is None or score > best["score"]):
+            best = {"entry": entry, "score": score, "matched": matched, "strong": phrase_hit or score >= 2}
+    return best
+
+
+def match_knowledge(db, message: str) -> Optional["KnowledgeEntry"]:
+    """Back-compat wrapper: just the entry (or None)."""
+    m = match_knowledge_detail(db, message)
+    return m["entry"] if m else None
+
+
+_ANSWER_PLACEHOLDER_RE = re.compile(r"\{(business_name|upi_id|upi_name|admin_contact|min_topup|usd_rate)\}")
+
+
+_PLACEHOLDER_FALLBACK = {"business_name": "hamari shop", "upi_id": "admin ke UPI", "upi_name": "admin",
+                         "admin_contact": "admin", "min_topup": "0", "usd_rate": "0"}
+
+
+def placeholder_values(settings: "SystemSettings") -> Dict[str, str]:
+    return {
+        "business_name": (settings.business_name or "").strip(),
+        "upi_id": (settings.admin_upi_id or "").strip(),
+        "upi_name": (settings.admin_upi_name or "").strip(),
+        "admin_contact": (settings.admin_contact_number or "").strip(),
+        "min_topup": f"{float(settings.reseller_credit_rate_inr or 0):,.0f}" if settings.reseller_credit_rate_inr else "",
+        "usd_rate": f"{float(settings.usd_to_inr_rate or 0):,.2f}" if settings.usd_to_inr_rate else "",
+    }
+
+
+def empty_placeholders(answer: str, settings: "SystemSettings") -> List[str]:
+    """Placeholders used in `answer` whose Setting is blank (admin should fill them in Settings)."""
+    vals = placeholder_values(settings)
+    return sorted({m.group(1) for m in _ANSWER_PLACEHOLDER_RE.finditer(answer or "") if not vals.get(m.group(1))})
+
+
+def render_knowledge_answer(answer: str, settings: "SystemSettings") -> str:
+    """Fill {business_name} {upi_id} {upi_name} {admin_contact} {min_topup} {usd_rate} in a trained
+    answer from live Settings, so trained text never goes stale. A blank Setting falls back to a
+    neutral word ("admin") instead of leaving a hole; unknown braces are left alone."""
+    vals = placeholder_values(settings)
+    return _ANSWER_PLACEHOLDER_RE.sub(lambda m: vals.get(m.group(1)) or _PLACEHOLDER_FALLBACK[m.group(1)], answer or "")
+
+
+def product_is_orderable(db, product: "Product") -> bool:
+    """A product can be sold right now: local stock, or it is supplier-backed (auto-buy on demand)."""
+    if product.get_available_stock_count(db) > 0:
+        return True
+    if (getattr(product, "source", "stock") or "stock") == "moonshots" and product.supplier_product_id:
+        try:
+            import moonshots_service as ms
+            return ms.is_ready()
+        except Exception:  # noqa: BLE001
+            return False
+    return False
 
 
 def stock_counts_by_product(db, product_ids: Optional[List[int]] = None) -> Dict[int, int]:

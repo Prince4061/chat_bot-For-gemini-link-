@@ -1401,6 +1401,11 @@ def admin_bot_test():
             }
         kb = match_knowledge(db, message)
         kb_match = {"id": kb.id, "question": kb.question, "answer": kb.answer} if kb else None
+        if kb:
+            from agent_core import knowledge_decision
+            _d = knowledge_decision(db, message, rec)
+            kb_match.update({"decision": _d["decision"], "reason": _d["reason"],
+                             "matched_keywords": (_d.get("match") or {}).get("matched", [])})
     finally:
         db.close()
 
@@ -1517,15 +1522,36 @@ def delete_knowledge(entry_id):
 @app.route("/api/admin/knowledge/test", methods=["POST"])
 @require_admin
 def test_knowledge():
-    """Try a question against the trained FAQ (shows which entry would answer)."""
-    from database import match_knowledge
-    q = str(_payload().get("question", "")).strip()
+    """Try a question against the trained FAQ: which entry matches, HOW (keywords/score), and
+    whether the bot would actually use it for this message (same decision logic as the bot)."""
+    from database import render_knowledge_answer, empty_placeholders
+    from agent_core import knowledge_decision
+    data = _payload()
+    q = str(data.get("question", "")).strip()
     if not q:
         return jsonify({"error": "question required"}), 400
+    platform = "whatsapp" if data.get("platform") == "whatsapp" else "web"
     db = get_db()
     try:
-        entry = match_knowledge(db, q)
-        return jsonify({"matched": bool(entry), "entry": entry.to_dict() if entry else None})
+        fake = ChatSessionRecord(id="kb_test", platform=platform, user_type="customer")   # not persisted
+        dec = knowledge_decision(db, q, fake)
+        m = dec.get("match")
+        st = agent_status()
+        return jsonify({
+            "matched": bool(m),
+            "entry": m["entry"].to_dict() if m else None,
+            "score": m["score"] if m else 0,
+            "matched_keywords": m["matched"] if m else [],
+            "strong": bool(m and m["strong"]),
+            "decision": dec["decision"],
+            "reason": dec["reason"],
+            "rendered_answer": render_knowledge_answer(m["entry"].answer, get_settings(db)) if m else None,
+            "empty_placeholders": empty_placeholders(m["entry"].answer, get_settings(db)) if m else [],
+            "engine": st["engine"],
+            "model": st["model"],
+            "llm_configured": st["llm_configured"],
+            "circuit_reason": st.get("circuit_reason"),
+        })
     finally:
         db.close()
 
