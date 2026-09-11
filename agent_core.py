@@ -431,6 +431,8 @@ def run_deep_agent_chat(
                     _r = db.query(Reseller).filter(Reseller.id == session_rec.reseller_id).first()
                     if _r and _r.is_active and not _r.is_locked():
                         fact_reply = _verified_reseller_fact_reply(db, _r, user_message)
+                        if not fact_reply and _repeat_claim_target(db, _r, user_message):
+                            fact_reply = "__repeat_claim__"   # rule engine performs the actual claim
                 # Trained answers: a confident match is answered EXACTLY as the admin trained it, on both
                 # engines (weak matches still go to the LLM, which has the whole FAQ in its prompt).
                 kb_first = None
@@ -590,6 +592,36 @@ def _fmt_links(links: List[str]) -> str:
 
 
 _GREETING_RE = re.compile(r"\W*(hi+|hello+|hey+|hii+|namaste|namaskar|start|menu|help|yo|ok|hlo)\W*")
+
+
+_REPEAT_RE = re.compile(r"\b(aur|more|again|dobara|phir\s*se|wahi|same|repeat)\b", re.I)
+
+
+def _repeat_claim_target(db, reseller: Reseller, user_message: str):
+    """'Ek aur' / 'one more' / '2 aur' right after a claim -> (product, qty) to claim again, else None.
+    Only when NO product is named (a named product goes through the normal claim path)."""
+    msg = (user_message or "").strip().lower()
+    if not msg or len(re.findall(r"[a-z0-9\u0900-\u097f]+", msg)) > 8 or not _REPEAT_RE.search(msg):
+        return None
+    if find_product(db, user_message):
+        return None
+    from database import WalletTransaction
+    last = (db.query(WalletTransaction)
+            .filter(WalletTransaction.reseller_id == reseller.id, WalletTransaction.reason == "link_purchase",
+                    WalletTransaction.product_id.isnot(None))
+            .order_by(WalletTransaction.id.desc()).first())
+    if not last:
+        return None
+    product = db.query(Product).filter(Product.id == last.product_id, Product.is_active == True).first()  # noqa: E712
+    if not product:
+        return None
+    qty = 1
+    m = re.search(r"(?<![\w.])(\d{1,2})(?![\w.])", msg)
+    if m and 1 <= int(m.group(1)) <= Config.MAX_CLAIM_QUANTITY:
+        qty = int(m.group(1))
+    elif re.search(r"\b(do|two)\s+aur\b|\baur\s+(do|two)\b", msg):
+        qty = 2
+    return product, qty
 
 
 def _verified_reseller_fact_reply(db, reseller: Reseller, user_message: str) -> Optional[str]:
@@ -764,6 +796,11 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
             fact = _verified_reseller_fact_reply(db, reseller, user_message)
             if fact:
                 return fact
+            repeat = _repeat_claim_target(db, reseller, user_message)
+            if repeat:
+                r_product, r_qty = repeat
+                record_tool_call("claim_reseller_product_link", True, f"repeat: {r_product.slug} x{r_qty}")
+                return _reseller_claim_reply(process_reseller_claim_for(reseller, r_product, r_qty, db))
             if product and not any(k in msg for k in _CATALOG_KEYWORDS) and kb_dec["decision"] != "kb":
                 # Claim only on clear intent ("gemini link do", "2 gemini", "gemini") — a QUESTION about
                 # the product ("gemini kaise activate kare") must never burn a link.

@@ -1429,6 +1429,23 @@ def suppliers_quote():
     return jsonify({"success": info.get("error") is None, "data": info, "usd_to_inr_rate": rate})
 
 
+@app.route("/api/admin/suppliers/dry-run/<int:prod_id>", methods=["GET"])
+@require_admin
+@rate_limited(30, "sup_dry")
+def suppliers_dry_run(prod_id):
+    """Why WOULD / WOULDN'T a sale auto-buy this product right now (live quotes + balances). No purchase."""
+    import suppliers
+    db = get_db()
+    try:
+        product = db.query(Product).filter(Product.id == prod_id).first()
+        if not product:
+            return jsonify({"error": "Product not found"}), 404
+        qty = request.args.get("qty", 1, type=int) or 1
+        return jsonify(suppliers.dry_run(db, product, needed=max(1, min(qty, 10))))
+    finally:
+        db.close()
+
+
 @app.route("/api/admin/suppliers/mapped", methods=["GET"])
 @require_admin
 @rate_limited(30, "sup_mapped")

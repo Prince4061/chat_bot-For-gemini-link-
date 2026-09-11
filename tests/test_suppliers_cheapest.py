@@ -247,3 +247,82 @@ def test_lootpaglu_price_key_drift_is_tolerated():
     assert n["price"] == 45.0 and n["stock"] == 5 and n["price_known"]
     z = lp._normalise_service({"service_id": "Paglu_3", "name": "Y", "available_stock": 9, "prices": {"upiPrice": 0}})
     assert z["price"] == 0.0 and z["price_known"] is False
+
+
+# ---- "ek aur" repeat, admin alert, dry run ---------------------------------------------------------
+
+def test_ek_aur_claims_the_same_product_again_without_llm(db, fresh_reseller, monkeypatch):
+    import agent_core
+    from langchain_core.messages import AIMessage
+
+    class _Hallucinating:   # an LLM that would repeat "stock nahi" from history
+        def invoke(self, payload):
+            return {"messages": [AIMessage(content="abhi stock mein nahi hai")], "todos": []}
+
+    monkeypatch.setattr(agent_core, "get_deep_agent", lambda: _Hallucinating())
+    p = _product(db); p.base_price = 1; db.commit()
+    _mock(monkeypatch, ms_price_usd=0.5, lp_price=0.0)
+    kw = dict(platform="whatsapp", owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    sid = f"wa_rep_{fresh_reseller.phone}"
+    first = agent_core.run_deep_agent_chat(sid, f"{p.name.lower()} link do", **kw)     # named product -> tool path
+    # (fake LLM never calls tools, so force the first claim through the rule engine)
+    if "ms0@x:pw" not in first["message"]:
+        monkeypatch.setattr(agent_core, "get_deep_agent", lambda: None)
+        first = agent_core.run_deep_agent_chat(sid, f"{p.name.lower()} link do", **kw)
+        monkeypatch.setattr(agent_core, "get_deep_agent", lambda: _Hallucinating())
+    assert "@x:pw" in first["message"]
+    second = agent_core.run_deep_agent_chat(sid, "Ek aur", **kw)
+    assert "@x:pw" in second["message"] and "stock mein nahi" not in second["message"]
+    assert any(t["tool"] == "claim_reseller_product_link" and "repeat" in t["detail"] for t in second["metadata"]["tool_calls"])
+    third = agent_core.run_deep_agent_chat(sid, "2 aur", **kw)
+    assert third["message"].count("@x:pw") == 2
+
+
+def test_ek_aur_without_prior_claim_is_not_a_claim(db, fresh_reseller, monkeypatch):
+    import agent_core
+    r = dbm.Reseller(name="Fresh Two", phone="7" + str(uuid.uuid4().int)[:9], secret_code="1111", currency="INR")
+    db.add(r); db.commit()
+    assert agent_core._repeat_claim_target(db, r, "ek aur") is None
+
+
+def test_admin_is_alerted_on_whatsapp_when_autobuy_fails(db, monkeypatch):
+    import evolution_service
+    sent = []
+    monkeypatch.setattr(evolution_service, "send_whatsapp_message", lambda remote_jid, message_text, **k: sent.append((remote_jid, message_text)) or {})
+    st = dbm.get_settings(db); st.admin_contact_number = "98765 43210"; db.commit()
+    suppliers._ALERTS.clear()
+    p = _product(db)
+    _mock(monkeypatch, ms_price_usd=1.0, lp_price=20.0)
+    monkeypatch.setattr(lp, "place_order", lambda sid, qty=1: (_ for _ in ()).throw(lp.LootPagluError("Insufficient INR wallet balance", "insufficient_balance", 400)))
+    monkeypatch.setattr(ms, "place_order", lambda pid, qty=1: (_ for _ in ()).throw(ms.MoonshotsError("insufficient balance", "insufficient_balance", 402)))
+    res = dbm.replenish_supplier_stock(db, p, 1)
+    import time
+    for _ in range(50):
+        if sent:
+            break
+        time.sleep(0.02)
+    assert res["bought"] == 0 and sent and sent[0][0] == "919876543210"
+    assert "Auto-buy FAILED" in sent[0][1] and "Insufficient INR wallet balance" in sent[0][1]
+    # rate-limited: a second failure right away does not spam
+    dbm.replenish_supplier_stock(db, p, 1); time.sleep(0.1)
+    assert len(sent) == 1
+    st.admin_contact_number = ""; db.commit()
+
+
+def test_dry_run_explains_verdict(client, admin_headers, db, monkeypatch):
+    p = _product(db)
+    _mock(monkeypatch, ms_price_usd=0.5, lp_price=0.0)
+    monkeypatch.setattr(ms, "status_dict", lambda: {"balance": 2.37, "currency": "USD", "enabled": True, "has_key": True, "error": None})
+    monkeypatch.setattr(lp, "status_dict", lambda: {"balance": 10.0, "currency": "INR", "enabled": True, "has_key": True, "error": None})
+    d = client.get(f"/api/admin/suppliers/dry-run/{p.id}", headers=admin_headers).get_json()
+    assert d["ok"] and d["chosen"] == "moonshots" and d["verdict"].startswith("✅") and "m00nshots" in d["verdict"]
+    # cheapest supplier but empty wallet -> explains balance
+    monkeypatch.setattr(ms, "status_dict", lambda: {"balance": 0.1, "currency": "USD", "enabled": True, "has_key": True, "error": None})
+    d2 = client.get(f"/api/admin/suppliers/dry-run/{p.id}", headers=admin_headers).get_json()
+    assert not d2["ok"] and "balance kam" in d2["verdict"]
+    # local-stock product -> auto-buy OFF
+    slug = f"loc-{uuid.uuid4().hex[:6]}"
+    q = dbm.Product(name=f"Local {slug}", slug=slug, base_price=1, margin_percent=0, reseller_margin_percent=0)
+    db.add(q); db.commit()
+    d3 = client.get(f"/api/admin/suppliers/dry-run/{q.id}", headers=admin_headers).get_json()
+    assert not d3["supplier_backed"] and "auto-buy OFF" in d3["verdict"]

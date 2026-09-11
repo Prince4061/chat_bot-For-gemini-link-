@@ -167,6 +167,7 @@ export const adminApi = {
   lootpagluStatus: async () => (await api.get('/admin/lootpaglu/status')).data,
   lootpagluProducts: async (search = '') => (await api.get('/admin/lootpaglu/products', { params: search ? { search } : {} })).data,
   suppliersMapped: async (fresh = false) => (await api.get('/admin/suppliers/mapped', { params: fresh ? { fresh: 1 } : {} })).data,
+  supplierDryRun: async (productId, qty = 1) => (await api.get(`/admin/suppliers/dry-run/${productId}`, { params: { qty } })).data,
   supplierQuote: async (supplier, ref, fresh = false) => (await api.get('/admin/suppliers/quote', { params: { supplier, ref, ...(fresh ? { fresh: 1 } : {}) } })).data,
 
   // Bot Tester (live chat with debug info)

@@ -35,6 +35,7 @@ export default function ProductManager() {
   // Live supplier quotes per LOCAL product id: { quotes: [...], chosen, reason, cap_inr }. Shows what
   // each mapped supplier charges (in ₹) and which one the bot would buy from right now.
   const [supInfo, setSupInfo] = useState({});
+  const [dryRun, setDryRun] = useState({});      // product id -> dry-run verdict
   const supTimers = useRef({});
 
   const loadSupplierInfo = async (fresh = false) => {
@@ -115,6 +116,16 @@ export default function ProductManager() {
       const cur = products.find(p => p.id === id);
       if (cur?.supplier_product_id) fetchQuoteFor(id, 'moonshots', cur.supplier_product_id, true);
       if (cur?.lootpaglu_service_id) fetchQuoteFor(id, 'lootpaglu', cur.lootpaglu_service_id, true);
+    }
+  };
+
+  const runDryRun = async (p) => {
+    setDryRun(prev => ({ ...prev, [p.id]: { loading: true } }));
+    try {
+      const res = await adminApi.supplierDryRun(p.id, 1);
+      setDryRun(prev => ({ ...prev, [p.id]: res }));
+    } catch (err) {
+      setDryRun(prev => ({ ...prev, [p.id]: { ok: false, verdict: 'Error: ' + (err.response?.data?.error || err.message) } }));
     }
   };
 
@@ -422,13 +433,33 @@ export default function ProductManager() {
                       </div>
                     );
                   })()}
-                  <button
-                    onClick={() => handleSaveSupplier(p)}
-                    disabled={savingMarginId === p.id}
-                    className="w-full py-1.5 bg-[#3a3a3a] hover:bg-[#4a4a4a] disabled:opacity-50 text-[#d4d4d4] font-semibold text-[11px] rounded-lg transition-all"
-                  >
-                    Save source
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => handleSaveSupplier(p)}
+                      disabled={savingMarginId === p.id}
+                      className="flex-1 py-1.5 bg-[#3a3a3a] hover:bg-[#4a4a4a] disabled:opacity-50 text-[#d4d4d4] font-semibold text-[11px] rounded-lg transition-all"
+                    >
+                      Save source
+                    </button>
+                    {(p.source || 'stock') !== 'stock' && (
+                      <button
+                        onClick={() => runDryRun(p)}
+                        disabled={dryRun[p.id]?.loading}
+                        title="Bina kharide dekho: abhi koi link maange to bot kahan se, kitne me kharidega — ya kyun nahi"
+                        className="flex-1 py-1.5 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/15 disabled:opacity-50 text-[#ececec] font-semibold text-[11px] rounded-lg transition-all"
+                      >
+                        {dryRun[p.id]?.loading ? 'Checking…' : 'Test auto-buy'}
+                      </button>
+                    )}
+                  </div>
+                  {dryRun[p.id] && !dryRun[p.id].loading && (
+                    <div className={`rounded-lg border p-2 text-[11px] leading-snug ${dryRun[p.id].ok ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-200' : 'bg-amber-950/40 border-amber-500/30 text-amber-200'}`}>
+                      <div>{dryRun[p.id].verdict}</div>
+                      {dryRun[p.id].balances && Object.keys(dryRun[p.id].balances).length > 0 && (
+                        <div className="opacity-80 mt-1">Balances: {Object.entries(dryRun[p.id].balances).map(([k, b]) => `${k}: ${b.error ? b.error : `${b.currency === 'INR' ? '₹' : '$'}${b.balance}`}`).join(' · ')} · Local stock: {dryRun[p.id].local_stock}</div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 

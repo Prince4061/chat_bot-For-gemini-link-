@@ -192,6 +192,10 @@ def replenish(db, product, needed: int) -> Dict[str, Any]:
         if not ordered:
             result["error"] = reason
             logger.warning("Auto-buy skipped for %s: %s", product.slug, reason)
+            try:
+                alert_admin_autobuy_failure(product, result)
+            except Exception:  # noqa: BLE001
+                pass
             return result
         attempts: List[str] = []
         # Try the best supplier first; if the PURCHASE itself fails (balance, stock race, 5xx),
@@ -228,7 +232,107 @@ def replenish(db, product, needed: int) -> Dict[str, Any]:
         msg = getattr(exc, "message", str(exc))
         result["error"] = msg
         logger.exception("replenish failed for %s: %s", product.slug, msg)
+    if not result["bought"] and result.get("error"):
+        try:
+            alert_admin_autobuy_failure(product, result)
+        except Exception:  # noqa: BLE001
+            pass
     return result
+
+
+_ALERTS: Dict[int, float] = {}          # product_id -> last alert ts (don't spam the admin)
+ALERT_COOLDOWN_SECONDS = 600
+
+
+def _admin_number() -> str:
+    try:
+        from database import get_db, get_settings
+        db = get_db()
+        try:
+            raw = (get_settings(db).admin_contact_number or "")
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        return ""
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) == 10:
+        digits = "91" + digits
+    return digits if len(digits) >= 11 else ""
+
+
+def alert_admin_autobuy_failure(product, result: Dict[str, Any]) -> bool:
+    """WhatsApp the admin WHY a sale just failed to auto-buy (rate-limited per product). Best-effort,
+    never raises, runs in a background thread so the buyer's reply is not delayed."""
+    import threading
+    import time
+    number = _admin_number()
+    if not number:
+        return False
+    now = time.time()
+    if now - _ALERTS.get(product.id, 0.0) < ALERT_COOLDOWN_SECONDS:
+        return False
+    _ALERTS[product.id] = now
+    lines = [f"⚠️ *Auto-buy FAILED* — {product.name}", f"Reason: {result.get('error')}"]
+    qs = result.get("quotes") or []
+    if qs:
+        lines.append("Quotes: " + " | ".join(
+            (f"{q.get('label')}: {q.get('error')}" if q.get("error")
+             else f"{q.get('label')} ₹{float(q.get('price_inr') or 0):.0f} (stock {q.get('stock')})") for q in qs))
+    lines.append("Buyer ko 'stock nahi' bola gaya, paisa nahi kata.")
+    lines.append("Fix: Admin → Products → is product ke card me 'Test auto-buy' dabao.")
+    text = "\n".join(lines)
+
+    def _send():
+        try:
+            from evolution_service import send_whatsapp_message
+            send_whatsapp_message(remote_jid=number, message_text=text)
+        except Exception:  # noqa: BLE001
+            logger.warning("admin auto-buy alert could not be sent", exc_info=True)
+
+    threading.Thread(target=_send, name="autobuy-alert", daemon=True).start()
+    return True
+
+
+def dry_run(db, product, needed: int = 1) -> Dict[str, Any]:
+    """Everything the admin needs to see why a sale would / would not auto-buy — WITHOUT buying."""
+    from database import get_settings
+    rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+    local = product.get_available_stock_count(db)
+    out: Dict[str, Any] = {"product": product.name, "product_id": product.id, "source": product.source or "stock",
+                           "supplier_backed": is_supplier_backed(product), "local_stock": local,
+                           "preference": getattr(product, "supplier_preference", None) or "cheapest",
+                           "cap_inr": price_cap_inr(product, rate), "usd_to_inr_rate": rate,
+                           "balances": {}, "quotes": [], "chosen": None, "reason": None, "verdict": "", "ok": False}
+    if not is_supplier_backed(product):
+        out["verdict"] = "Stock source 'Local stock' hai ya koi supplier ID mapped nahi — auto-buy OFF. Sirf local stock (" + str(local) + ") se dega."
+        return out
+    mods = _mods()
+    for name in refs_for(product):
+        try:
+            st = mods[name].status_dict()
+            out["balances"][name] = {"balance": st.get("balance"), "currency": st.get("currency"), "error": st.get("error"),
+                                     "enabled": st.get("enabled"), "has_key": st.get("has_key")}
+        except Exception as exc:  # noqa: BLE001
+            out["balances"][name] = {"error": type(exc).__name__}
+    qc = quotes_with_choice(product, rate, needed=needed, fresh=True)
+    out.update(quotes=qc["quotes"], chosen=qc["chosen"], reason=qc["reason"])
+    if not qc["chosen"]:
+        out["verdict"] = f"❌ NAHI kharid payega: {qc['reason']}"
+        return out
+    best = next(q for q in qc["quotes"] if q["supplier"] == qc["chosen"])
+    bal = out["balances"].get(qc["chosen"], {})
+    need_amt = float(best["price_inr"]) * max(1, needed)
+    bal_inr = None
+    if bal.get("balance") is not None:
+        bal_inr = float(bal["balance"]) * (rate if (bal.get("currency") or "").upper() == "USD" else 1.0)
+    if bal_inr is not None and bal_inr < float(best["price_inr"]):
+        out["verdict"] = (f"❌ {best['label']} sabse sasta hai (₹{float(best['price_inr']):.0f}) par uska balance kam hai "
+                          f"(≈₹{bal_inr:.0f}). Wahan top-up karo, ya doosra supplier map karo.")
+        return out
+    out["ok"] = True
+    out["verdict"] = (f"✅ Kharid payega: {best['label']} se ₹{float(best['price_inr']):.0f}/unit ({best.get('name')}), "
+                      f"stock {best.get('stock')}" + (f", balance ≈₹{bal_inr:.0f}" if bal_inr is not None else "") + f". {qc['reason']}")
+    return out
 
 
 def status_all() -> Dict[str, Any]:
