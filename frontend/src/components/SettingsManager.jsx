@@ -608,9 +608,14 @@ function SupplierCard({ label, keyField, enabledField, statusFn, productsFn, set
             {items.map((it) => (
               <div key={it.id} className="p-2.5 text-[11px] flex items-center justify-between gap-2">
                 <span className="text-[#d4d4d4]">{it.icon ? `${it.icon} ` : ''}{it.name}{it.category ? <span className="text-[#8e8ea0]"> · {it.category}</span> : null}</span>
-                <span className="text-[#8e8ea0] whitespace-nowrap">{idLabel} <b className="text-[#ececec] font-mono">{it.id}</b> · {it.currency === 'INR' ? '₹' : '$'}{it.price} · stock {it.stock}</span>
+                <span className="text-[#8e8ea0] whitespace-nowrap">{idLabel} <b className="text-[#ececec] font-mono">{it.id}</b> · {it.price > 0 ? `${it.currency === 'INR' ? '₹' : '$'}${it.price}` : <span className="text-rose-300">price nahi mila</span>} · stock {it.stock}</span>
               </div>
             ))}
+            {items.some((it) => !(it.price > 0) && it.raw_keys?.length > 0) && (
+              <div className="p-2.5 text-[10px] text-amber-300 font-mono break-all">
+                ⚠ Supplier API price kis field me bhej raha hai, pata nahi chala — is line ka screenshot bhejo. Fields: {items.find((it) => !(it.price > 0) && it.raw_keys?.length > 0).raw_keys.join(' · ')}
+              </div>
+            )}
           </div>
         )}
       </div>

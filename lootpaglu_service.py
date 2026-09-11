@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -131,8 +131,48 @@ def list_products(max_age: int = LIST_CACHE_SECONDS) -> List[Dict[str, Any]]:
     items = []
     for svc in raw:
         items.append(_normalise_service(svc))
+    # Price missing in the list (₹0)? Use what we actually PAID last time for that service (order
+    # history, currency inr) - authoritative and never 0.
+    if any(not it["price_known"] for it in items):
+        hist = _order_history_unit_prices()
+        for it in items:
+            if not it["price_known"]:
+                paid = hist.get(_norm_name(it["name"]))
+                if paid and paid > 0:
+                    it.update(price=paid, price_known=True, price_source="order_history", raw_keys=[])
     _LIST_CACHE.update(ts=time.time(), items=items)
     return items
+
+
+def _norm_name(name: Any) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+
+
+_HIST_CACHE: Dict[str, Any] = {"ts": 0.0, "prices": {}}
+HIST_CACHE_SECONDS = 600
+
+
+def _order_history_unit_prices(max_age: int = HIST_CACHE_SECONDS) -> Dict[str, float]:
+    """service name -> latest INR unit price we paid (amount / quantity), from /api/v1/orders."""
+    if _HIST_CACHE["prices"] and time.time() - _HIST_CACHE["ts"] < max_age:
+        return _HIST_CACHE["prices"]
+    prices: Dict[str, float] = {}
+    try:
+        d = _request("GET", "/api/v1/orders", params={"page": 1, "limit": 100})
+        for o in d.get("orders", []) or []:                      # newest first per the docs sample
+            cur = str(o.get("currency") or "inr").lower()
+            if cur not in ("inr", "upi", ""):
+                continue
+            name = _norm_name(o.get("service"))
+            qty = int(_num(o.get("quantity")) or 1) or 1
+            amt = _num(o.get("amount", o.get("total_cost")))
+            if name and amt > 0 and name not in prices:
+                prices[name] = round(amt / qty, 2)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Loot Paglu order history unavailable for price fallback: %s", type(exc).__name__)
+    _HIST_CACHE.update(ts=time.time(), prices=prices)
+    return prices
 
 
 def _num(v) -> float:
@@ -149,12 +189,78 @@ def _first_price(d: Dict[str, Any], keys) -> float:
     return 0.0
 
 
+_SKIP_TOKENS = ("crypto", "usd", "usdt", "btc", "eth", "stock", "qty", "quantity", "min", "max", "discount", "old",
+                "original", "mrp", "warranty", "days", "id", "count", "sold", "total", "limit", "commission", "fee")
+_INR_TOKENS = ("upi", "inr", "rupee", "rs")
+_PRICE_TOKENS = ("price", "amount", "rate", "cost", "selling", "sale")
+
+
+def _find_inr_price(obj: Any) -> Tuple[float, str]:
+    """Walk the whole service object and return (value, key_path) of the most plausible INR price:
+    keys mentioning upi/inr win; then generic price/amount/rate/cost; crypto/usd/stock-ish keys are
+    skipped; a sibling `currency` field is honoured. Returns (0.0, '') when nothing > 0 is found."""
+    best: Tuple[int, float, str] = (99, 0.0, "")
+
+    def visit(node: Any, path: str, sibling_currency: str):
+        nonlocal best
+        if isinstance(node, dict):
+            cur = str(node.get("currency") or node.get("curr") or sibling_currency or "").lower()
+            for k, v in node.items():
+                visit(v, f"{path}.{k}" if path else str(k), cur)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                visit(v, f"{path}[{i}]", sibling_currency)
+        else:
+            val = _num(node)
+            if val <= 0:
+                return
+            key_l = path.lower()
+            leaf = key_l.rsplit(".", 1)[-1]
+            if any(t in leaf for t in _SKIP_TOKENS) or "crypto" in key_l:
+                return
+            if sibling_currency and any(t in sibling_currency for t in ("usd", "usdt", "btc", "crypto", "eth")):
+                return
+            if any(t in key_l for t in _INR_TOKENS) or (sibling_currency and "inr" in sibling_currency):
+                pri = 0
+            elif any(t in leaf for t in _PRICE_TOKENS):
+                pri = 1
+            else:
+                return
+            if pri < best[0]:
+                best = (pri, val, path)
+
+    visit(obj, "", "")
+    return best[1], best[2]
+
+
+def _key_paths(obj: Any, prefix: str = "", limit: int = 30) -> List[str]:
+    out: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (dict, list)):
+                out.extend(_key_paths(v, path, limit))
+            else:
+                out.append(f"{path}={str(v)[:20]}")
+            if len(out) >= limit:
+                break
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:3]):
+            out.extend(_key_paths(v, f"{prefix}[{i}]", limit))
+    return out[:limit]
+
+
 def _normalise_service(svc: Dict[str, Any]) -> Dict[str, Any]:
     """Tolerant of key drift: the docs say prices.upiPrice, but a 0/missing value must NEVER look
     like a ₹0 bargain — it becomes price=0 which the orchestrator treats as 'price unavailable'."""
-    prices = svc.get("prices") or {}
+    prices = svc.get("prices") or svc.get("pricing") or svc.get("price") or {}
+    if not isinstance(prices, dict):
+        prices = {}
     price = _first_price(prices, ("upiPrice", "upi_price", "inr", "INR", "price_inr", "price")) \
         or _first_price(svc, ("upiPrice", "upi_price", "price_inr", "price", "inr_price"))
+    price_source = "prices.upiPrice" if price > 0 else ""
+    if price <= 0:
+        price, price_source = _find_inr_price(svc)          # any shape: nested, list, odd names
     crypto = _first_price(prices, ("cryptoPrice", "crypto_price", "usd", "USD")) or _first_price(svc, ("cryptoPrice",))
     try:
         stock = int(_num(svc.get("available_stock", svc.get("stock", 0))))
@@ -169,6 +275,9 @@ def _normalise_service(svc: Dict[str, Any]) -> Dict[str, Any]:
         "stock": stock, "in_stock": stock > 0,
         "requires_verification": bool(svc.get("requires_shein_verification")),
         "price_known": price > 0,
+        "price_source": price_source,
+        # when no price could be found, show the real field names so the admin can tell us
+        "raw_keys": [] if price > 0 else _key_paths(svc),
     }
 
 
@@ -216,6 +325,13 @@ def place_order(service_id: str, quantity: int = 1) -> Dict[str, Any]:
            "currency": CURRENCY}
     if creds and out["total"] is not None:
         out["unit_price"] = round(float(out["total"]) / len(creds), 2)
+        try:                                                      # remember the real ₹ price for this service
+            for it in _LIST_CACHE.get("items") or []:
+                if it["id"] == str(service_id):
+                    _HIST_CACHE["prices"][_norm_name(it["name"])] = out["unit_price"]
+                    _HIST_CACHE["ts"] = time.time()
+        except Exception:  # noqa: BLE001
+            pass
     _LIST_CACHE["ts"] = 0.0   # stock changed
     logger.info("Loot Paglu order %s: bought %s x %s, %d code(s), balance left %s",
                 out["order_code"], quantity, service_id, len(creds), out["remaining_balance"])

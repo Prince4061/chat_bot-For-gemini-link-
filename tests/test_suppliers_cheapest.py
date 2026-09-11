@@ -396,3 +396,39 @@ def test_duplicate_deliveries_report(client, admin_headers, db):
     item = next(i for i in r["items"] if i["product"] == p.name)
     assert item["times_delivered"] == 3 and item["deliveries"][0]["first"] is True
     assert [d["claimed_by_id"] for d in item["deliveries"][1:]] == ["9111111111", "9222222222"]   # refund these
+
+
+def test_lootpaglu_finds_inr_price_in_any_shape():
+    shapes = [
+        {"service_id": "a", "prices": {"upiPrice": 0, "upi_price_inr": 55}},
+        {"service_id": "b", "pricing": {"inr": {"upi": "60"}, "crypto": {"usdt": 0.6}}},
+        {"service_id": "c", "prices": [{"currency": "USDT", "price": 0.5}, {"currency": "INR", "price": 65}]},
+        {"service_id": "d", "priceINR": 70, "cryptoPrice": 0.7},
+        {"service_id": "e", "rate": {"upi": 75}, "available_stock": 9},
+    ]
+    got = [lp._normalise_service(x)["price"] for x in shapes]
+    assert got == [55.0, 60.0, 65.0, 70.0, 75.0]
+    none = lp._normalise_service({"service_id": "z", "prices": {"upiPrice": 0, "cryptoPrice": 0.4}, "available_stock": 3})
+    assert none["price"] == 0.0 and none["price_known"] is False and any("upiPrice" in k for k in none["raw_keys"])
+    # never mistake stock / crypto / ids for a price
+    trap = lp._normalise_service({"service_id": "t", "available_stock": 1382, "id": 99, "prices": {"cryptoPrice": 0.9}})
+    assert trap["price"] == 0.0
+
+
+def test_lootpaglu_list_price_zero_falls_back_to_order_history(monkeypatch):
+    def fake_request(method, path, **k):
+        if path == "/api/v1/products":
+            return {"status": "success", "services": [
+                {"service_id": "Paglu_1", "name": "Gemini 18 Months Pro 💎", "available_stock": 1382,
+                 "prices": {"upiPrice": 0, "cryptoPrice": 0.5}}]}
+        if path == "/api/v1/orders":
+            return {"success": True, "orders": [
+                {"order_id": "api_2", "service": "Gemini 18 Months Pro 💎", "quantity": 2, "amount": 100.0, "currency": "inr", "status": "success"},
+                {"order_id": "api_1", "service": "Gemini 18 Months Pro 💎", "quantity": 1, "amount": 55.0, "currency": "inr", "status": "success"}]}
+        raise AssertionError(path)
+    monkeypatch.setattr(lp, "_request", fake_request)
+    lp._LIST_CACHE.update(ts=0.0, items=[]); lp._HIST_CACHE.update(ts=0.0, prices={})
+    items = lp.list_products(max_age=0)
+    assert items[0]["price"] == 50.0 and items[0]["price_known"] and items[0]["price_source"] == "order_history"
+    summ = lp.product_summary("Paglu_1", max_age=0)
+    assert summ["error"] is None and summ["price_inr"] == 50.0          # usable for cheapest-supplier choice
