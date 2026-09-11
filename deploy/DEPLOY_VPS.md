@@ -175,8 +175,14 @@ systemctl restart vending-bot
 > ⚠️ Ye automated WhatsApp messaging hai. WhatsApp ke terms ka dhyaan rakho —
 > known customers/chhote scale ke liye theek; bade scale pe official WhatsApp Cloud API behtar.
 
-## m00nshots Auto-Buy Supplier (optional)
+## Auto-Buy Suppliers (optional): m00nshots + Loot Paglu — jo sasta ho wahi se
 Bot kisi product ke liye stock khatam hone par supplier se khud khareed ke user ko de sakta hai.
-- Admin -> Settings -> **m00nshots Auto-Buy Supplier**: API key daalo (Telegram bot ka `/api`), **enabled** karo.
-- Admin -> Products -> product ka **Stock source** = "m00nshots auto-buy" + supplier product ID (Settings -> Browse se milegi) + optional max buy price ($).
-- Default OFF. `.env` me `MOONSHOTS_API_KEY` bhi de sakte ho (UI key overrides). Supplier balance khatam ho to bot normal "out of stock" bolta hai, koi paisa nahi katta.
+Ek product **dono** suppliers se map ho sakta hai — bot har baar dono ka live price ₹ me dekh ke
+**jo sasta ho (aur stock me ho)** usse kharidta hai. Ek hi mapped ho to wahi.
+- Admin -> Settings -> **m00nshots** card: API key (Telegram bot `/api`) + enabled. Prices USD (Settings ke USD→INR rate se ₹ me compare).
+- Admin -> Settings -> **Loot Paglu** card: API key (`X-API-Key`, lootpaglu.in) + enabled. Prices seedha ₹.
+- Admin -> Products -> **Stock source = Auto-buy (cheapest supplier)** -> m00nshots product ID aur/ya Loot Paglu service ID
+  (Settings -> Browse se milti hain) -> "Kahan se kharide" (auto / sirf ek) -> optional **Max buy price (₹)**.
+  Card me dono ka live price + stock dikhta hai aur ✓ kis se kharidega.
+- Default OFF. `.env` me `MOONSHOTS_API_KEY` / `LOOTPAGLU_API_KEY` bhi de sakte ho (UI key overrides).
+  Supplier balance khatam / out of stock / cap se upar -> bot normal "out of stock" bolta hai, koi paisa nahi katta.

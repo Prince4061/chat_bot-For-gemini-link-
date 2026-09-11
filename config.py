@@ -102,7 +102,11 @@ class Config:
     MOONSHOTS_API_URL: str = os.getenv("MOONSHOTS_API_URL", "https://instant.m00nshots.store/api/v1").strip()
     MOONSHOTS_API_KEY: str = os.getenv("MOONSHOTS_API_KEY", "").strip()   # UI key overrides this
     MOONSHOTS_TIMEOUT_SECONDS: int = _env_int("MOONSHOTS_TIMEOUT_SECONDS", 30)
-    MOONSHOTS_MAX_AUTOBUY_QTY: int = _env_int("MOONSHOTS_MAX_AUTOBUY_QTY", 10)
+    MOONSHOTS_MAX_AUTOBUY_QTY: int = _env_int("MOONSHOTS_MAX_AUTOBUY_QTY", 10)   # applies to every supplier
+    # Supplier #2: Loot Paglu (INR prices, X-API-Key header). UI key overrides env.
+    LOOTPAGLU_API_URL: str = os.getenv("LOOTPAGLU_API_URL", "https://lootpaglu.in").strip()
+    LOOTPAGLU_API_KEY: str = os.getenv("LOOTPAGLU_API_KEY", "").strip()
+    LOOTPAGLU_TIMEOUT_SECONDS: int = _env_int("LOOTPAGLU_TIMEOUT_SECONDS", 30)
 
     # --- WhatsApp / Evolution -----------------------------------------------
     EVOLUTION_API_URL: str = os.getenv("EVOLUTION_API_URL", "http://localhost:8080").strip()

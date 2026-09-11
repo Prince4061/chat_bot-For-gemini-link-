@@ -32,37 +32,48 @@ export default function ProductManager() {
 
   const priceWithMargin = (base, pct) => Math.round((base + (base * (parseFloat(pct) || 0) / 100)) * 100) / 100;
 
-  // Live m00nshots info (name / $ price / ≈₹ / stock) per LOCAL product id, so the admin never has
-  // to open Browse to see what the supplier currently charges.
+  // Live supplier quotes per LOCAL product id: { quotes: [...], chosen, reason, cap_inr }. Shows what
+  // each mapped supplier charges (in ₹) and which one the bot would buy from right now.
   const [supInfo, setSupInfo] = useState({});
-  const [supLoading, setSupLoading] = useState(false);
   const supTimers = useRef({});
 
   const loadSupplierInfo = async (fresh = false) => {
     try {
-      setSupLoading(true);
-      const res = await adminApi.moonshotsMapped(fresh);
+      const res = await adminApi.suppliersMapped(fresh);
       setSupInfo(prev => ({ ...prev, ...(res.items || {}) }));
     } catch (err) {
       console.error(err);
-    } finally {
-      setSupLoading(false);
     }
   };
 
-  // Called (debounced) while the admin types a supplier id, so the card shows that id's live price
-  // before they even press "Save source".
-  const fetchSupplierInfoFor = (localId, supplierId, fresh = false) => {
-    clearTimeout(supTimers.current[localId]);
-    const sid = parseInt(supplierId, 10);
-    if (!sid) { setSupInfo(prev => ({ ...prev, [localId]: null })); return; }
-    supTimers.current[localId] = setTimeout(async () => {
-      setSupInfo(prev => ({ ...prev, [localId]: { loading: true } }));
+  // Same rule as the server: cheapest usable quote in ₹ (or the forced preference), under the cap.
+  const pickChoice = (quotes, preference, cap) => {
+    let usable = (quotes || []).filter(q => q && !q.error && q.price_inr != null && (q.stock || 0) > 0);
+    if (preference === 'moonshots' || preference === 'lootpaglu') usable = usable.filter(q => q.supplier === preference);
+    if (cap != null && cap !== '') usable = usable.filter(q => Number(q.price_inr) <= Number(cap));
+    if (!usable.length) return null;
+    return usable.reduce((a, b) => (Number(b.price_inr) < Number(a.price_inr) ? b : a)).supplier;
+  };
+
+  // Debounced live quote while the admin types a supplier id (before "Save source").
+  const fetchQuoteFor = (localId, supplier, ref, fresh = false) => {
+    const key = `${localId}:${supplier}`;
+    clearTimeout(supTimers.current[key]);
+    const clean = String(ref ?? '').trim();
+    const upsert = (q) => setSupInfo(prev => {
+      const cur = prev[localId] || { quotes: [] };
+      const quotes = (cur.quotes || []).filter(x => x.supplier !== supplier);
+      if (q) quotes.push(q);
+      return { ...prev, [localId]: { ...cur, quotes, chosen: undefined } };
+    });
+    if (!clean) { upsert(null); return; }
+    supTimers.current[key] = setTimeout(async () => {
+      upsert({ supplier, ref: clean, loading: true });
       try {
-        const res = await adminApi.moonshotsProduct(sid, fresh);
-        setSupInfo(prev => ({ ...prev, [localId]: res.data }));
+        const res = await adminApi.supplierQuote(supplier, clean, fresh);
+        upsert({ ...res.data, ready: !res.data?.error || res.data?.error === undefined });
       } catch (err) {
-        setSupInfo(prev => ({ ...prev, [localId]: { error: err.response?.data?.error || err.message } }));
+        upsert({ supplier, ref: clean, error: err.response?.data?.error || err.message });
       }
     }, fresh ? 0 : 600);
   };
@@ -72,7 +83,7 @@ export default function ProductManager() {
       setLoading(true);
       const data = await adminApi.getProducts();
       setProducts(data);
-      if (data.some(p => p.source === 'moonshots' && p.supplier_product_id)) loadSupplierInfo();
+      if (data.some(p => p.supplier_backed)) loadSupplierInfo();
     } catch (err) {
       console.error(err);
     } finally {
@@ -98,23 +109,28 @@ export default function ProductManager() {
 
   const handleSupplierChange = (id, field, value) => {
     setProducts(products.map(p => (p.id === id ? { ...p, [field]: value } : p)));
-    if (field === 'supplier_product_id') fetchSupplierInfoFor(id, value);
-    if (field === 'source' && value === 'moonshots') {
+    if (field === 'supplier_product_id') fetchQuoteFor(id, 'moonshots', value);
+    if (field === 'lootpaglu_service_id') fetchQuoteFor(id, 'lootpaglu', value);
+    if (field === 'source' && value === 'supplier') {
       const cur = products.find(p => p.id === id);
-      if (cur?.supplier_product_id) fetchSupplierInfoFor(id, cur.supplier_product_id);
+      if (cur?.supplier_product_id) fetchQuoteFor(id, 'moonshots', cur.supplier_product_id, true);
+      if (cur?.lootpaglu_service_id) fetchQuoteFor(id, 'lootpaglu', cur.lootpaglu_service_id, true);
     }
   };
 
   const handleSaveSupplier = async (p) => {
     try {
       setSavingMarginId(p.id);
+      const src = p.source === 'moonshots' ? 'supplier' : (p.source || 'stock');
       await adminApi.updateProduct(p.id, {
-        source: p.source || 'stock',
+        source: src,
         supplier_product_id: p.supplier_product_id === '' ? null : p.supplier_product_id,
-        supplier_max_price: p.supplier_max_price === '' ? null : p.supplier_max_price,
+        lootpaglu_service_id: p.lootpaglu_service_id === '' ? null : p.lootpaglu_service_id,
+        supplier_preference: p.supplier_preference || 'cheapest',
+        max_buy_price_inr: p.max_buy_price_inr === '' ? null : p.max_buy_price_inr,
       });
-      setSuccessMsg((p.source === 'moonshots')
-        ? `Auto-buy ON: stock khatam hone par bot m00nshots product #${p.supplier_product_id} khud khareed ke dega.`
+      setSuccessMsg(src === 'supplier'
+        ? 'Auto-buy ON: stock khatam hone par bot mapped suppliers me se sabse saste se khud khareed ke dega.'
         : 'Source set to local stock.');
       setTimeout(() => setSuccessMsg(''), 4000);
       loadProducts();
@@ -315,77 +331,97 @@ export default function ProductManager() {
                   <div className="flex justify-between items-center text-xs">
                     <span className="text-[#ececec] font-medium">Stock source</span>
                     <select
-                      value={p.source || 'stock'}
+                      value={p.source === 'moonshots' || p.source === 'lootpaglu' ? 'supplier' : (p.source || 'stock')}
                       onChange={(e) => handleSupplierChange(p.id, 'source', e.target.value)}
                       className="py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-xs text-[#ececec] focus:outline-none"
                     >
                       <option value="stock">Local stock</option>
-                      <option value="moonshots">m00nshots auto-buy</option>
+                      <option value="supplier">Auto-buy (cheapest supplier)</option>
                     </select>
                   </div>
-                  {(p.source || 'stock') === 'moonshots' && (
-                    <div className="space-y-2">
-                      <div className="flex justify-between items-center text-xs gap-2">
-                        <span className="text-[#8e8ea0] whitespace-nowrap" title="Supplier catalogue me product ki ID (Settings → m00nshots → Browse)">Supplier product ID</span>
-                        <input
-                          type="number" min="1" placeholder="e.g. 42"
-                          value={p.supplier_product_id ?? ''}
-                          onChange={(e) => handleSupplierChange(p.id, 'supplier_product_id', e.target.value)}
-                          className="w-24 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] focus:outline-none"
-                        />
-                      </div>
-                      <div className="flex justify-between items-center text-xs gap-2">
-                        <span className="text-[#8e8ea0] whitespace-nowrap" title="Is price se upar supplier ho to auto-buy nahi hoga (USD). Khaali = no cap">Max buy price ($)</span>
-                        <input
-                          type="number" min="0" step="0.01" placeholder="optional"
-                          value={p.supplier_max_price ?? ''}
-                          onChange={(e) => handleSupplierChange(p.id, 'supplier_max_price', e.target.value)}
-                          className="w-24 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] focus:outline-none"
-                        />
-                      </div>
-                      {/* Live supplier info for the mapped id — no need to open Browse */}
-                      {p.supplier_product_id && (() => {
-                        const info = supInfo[p.id];
-                        const rupee = info && !info.error && !info.loading ? Number(info.price_inr || 0) : null;
-                        const losing = rupee !== null && rupee > Number(p.base_price || 0);
-                        return (
+                  {(p.source || 'stock') !== 'stock' && (() => {
+                    const info = supInfo[p.id] || {};
+                    const quotes = info.quotes || [];
+                    const chosen = info.chosen !== undefined ? info.chosen : pickChoice(quotes, p.supplier_preference || 'cheapest', p.max_buy_price_inr);
+                    const chosenQ = quotes.find(q => q.supplier === chosen);
+                    const losing = chosenQ && Number(chosenQ.price_inr) > Number(p.base_price || 0);
+                    return (
+                      <div className="space-y-2">
+                        <div className="flex justify-between items-center text-xs gap-2">
+                          <span className="text-[#8e8ea0] whitespace-nowrap" title="m00nshots catalogue me product ki ID (Settings → m00nshots → Browse)">m00nshots product ID</span>
+                          <input type="number" min="1" placeholder="e.g. 42"
+                            value={p.supplier_product_id ?? ''}
+                            onChange={(e) => handleSupplierChange(p.id, 'supplier_product_id', e.target.value)}
+                            className="w-28 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] focus:outline-none" />
+                        </div>
+                        <div className="flex justify-between items-center text-xs gap-2">
+                          <span className="text-[#8e8ea0] whitespace-nowrap" title="Loot Paglu service id (Settings → Loot Paglu → Browse)">Loot Paglu service ID</span>
+                          <input type="text" placeholder="e.g. Paglu_1"
+                            value={p.lootpaglu_service_id ?? ''}
+                            onChange={(e) => handleSupplierChange(p.id, 'lootpaglu_service_id', e.target.value)}
+                            className="w-28 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] font-mono focus:outline-none" />
+                        </div>
+                        <div className="flex justify-between items-center text-xs gap-2">
+                          <span className="text-[#8e8ea0] whitespace-nowrap">Kahan se kharide</span>
+                          <select value={p.supplier_preference || 'cheapest'}
+                            onChange={(e) => handleSupplierChange(p.id, 'supplier_preference', e.target.value)}
+                            className="py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-xs text-[#ececec] focus:outline-none">
+                            <option value="cheapest">Jo sasta ho (auto)</option>
+                            <option value="moonshots">Sirf m00nshots</option>
+                            <option value="lootpaglu">Sirf Loot Paglu</option>
+                          </select>
+                        </div>
+                        <div className="flex justify-between items-center text-xs gap-2">
+                          <span className="text-[#8e8ea0] whitespace-nowrap" title="Is ₹ price se upar koi bhi supplier ho to auto-buy nahi hoga. Khaali = no cap">Max buy price (₹)</span>
+                          <input type="number" min="0" step="0.01" placeholder="optional"
+                            value={p.max_buy_price_inr ?? ''}
+                            onChange={(e) => handleSupplierChange(p.id, 'max_buy_price_inr', e.target.value)}
+                            className="w-28 py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-right text-xs text-[#ececec] focus:outline-none" />
+                        </div>
+
+                        {/* Live quotes from every mapped supplier + which one the bot will use */}
+                        {(p.supplier_product_id || p.lootpaglu_service_id) && (
                           <div className="rounded-lg bg-[#212121] border border-white/10 p-2 text-[11px] space-y-1">
                             <div className="flex items-center justify-between gap-2">
-                              <span className="text-[#8e8ea0]">m00nshots live</span>
+                              <span className="text-[#8e8ea0]">Live supplier prices</span>
                               <button type="button" title="Abhi refresh karo"
-                                onClick={() => fetchSupplierInfoFor(p.id, p.supplier_product_id, true)}
+                                onClick={() => { if (p.supplier_product_id) fetchQuoteFor(p.id, 'moonshots', p.supplier_product_id, true); if (p.lootpaglu_service_id) fetchQuoteFor(p.id, 'lootpaglu', p.lootpaglu_service_id, true); }}
                                 className="text-[#8e8ea0] hover:text-[#ececec] px-1 rounded">
-                                <RefreshCw className={`w-3 h-3 ${info?.loading ? 'animate-spin' : ''}`} />
+                                <RefreshCw className={`w-3 h-3 ${quotes.some(q => q.loading) ? 'animate-spin' : ''}`} />
                               </button>
                             </div>
-                            {!info || info.loading ? (
-                              <div className="text-[#8e8ea0]">Price load ho raha hai…</div>
-                            ) : info.error ? (
-                              <div className="text-rose-300 break-words">{info.error}</div>
-                            ) : (
-                              <>
-                                <div className="text-[#ececec] font-semibold truncate" title={info.name}>{info.icon} {info.name}</div>
-                                <div className="flex justify-between items-center">
-                                  <span className="text-[#8e8ea0]">Supplier price</span>
-                                  <span className="font-bold text-emerald-300">${Number(info.price).toFixed(2)}
-                                    <span className="text-[#8e8ea0] font-normal"> ≈ ₹{rupee.toFixed(0)}</span>
-                                  </span>
-                                </div>
-                                <div className="flex justify-between items-center">
-                                  <span className="text-[#8e8ea0]">Supplier stock</span>
-                                  <span className={info.in_stock ? 'text-[#d4d4d4]' : 'text-rose-300'}>{info.in_stock ? info.stock : 'out of stock'}</span>
-                                </div>
-                                {losing && (
-                                  <div className="text-amber-300 leading-snug">⚠ Supplier price (₹{rupee.toFixed(0)}) aapke base price (₹{Number(p.base_price).toFixed(0)}) se zyada — base price badhao warna nuksan.</div>
-                                )}
-                              </>
+                            {quotes.length === 0 && <div className="text-[#8e8ea0]">Price load ho raha hai…</div>}
+                            {quotes.map((q) => (
+                              <div key={q.supplier} className={`flex items-center justify-between gap-2 rounded px-1.5 py-1 ${q.supplier === chosen ? 'bg-emerald-950/40 border border-emerald-500/30' : ''}`}>
+                                <span className="min-w-0 truncate">
+                                  <span className={q.supplier === chosen ? 'text-emerald-200 font-semibold' : 'text-[#d4d4d4]'}>{q.label || q.supplier}</span>
+                                  {q.name && <span className="text-[#8e8ea0]"> · {q.name}</span>}
+                                </span>
+                                <span className="whitespace-nowrap">
+                                  {q.loading ? <span className="text-[#8e8ea0]">…</span>
+                                    : q.error ? <span className="text-rose-300">{q.error}</span>
+                                    : <>
+                                        <span className={q.supplier === chosen ? 'text-emerald-300 font-bold' : 'text-[#ececec]'}>₹{Number(q.price_inr).toFixed(0)}</span>
+                                        {q.currency === 'USD' && <span className="text-[#8e8ea0]"> (${Number(q.price).toFixed(2)})</span>}
+                                        <span className={`ml-1 ${(q.stock || 0) > 0 ? 'text-[#8e8ea0]' : 'text-rose-300'}`}>· {(q.stock || 0) > 0 ? `stock ${q.stock}` : 'out of stock'}</span>
+                                        {q.supplier === chosen && <span className="ml-1 text-emerald-300">✓ yahan se</span>}
+                                      </>}
+                                </span>
+                              </div>
+                            ))}
+                            {info.reason && quotes.length > 1 && <div className="text-[#8e8ea0]">{info.reason}</div>}
+                            {quotes.length > 0 && !chosen && !quotes.some(q => q.loading) && (
+                              <div className="text-amber-300">⚠ Abhi kisi supplier se nahi kharid payega (stock/cap/error dekho).</div>
+                            )}
+                            {losing && (
+                              <div className="text-amber-300 leading-snug">⚠ Chuna gaya price ₹{Number(chosenQ.price_inr).toFixed(0)} aapke base price ₹{Number(p.base_price).toFixed(0)} se zyada — base price badhao warna nuksan.</div>
                             )}
                           </div>
-                        );
-                      })()}
-                      <p className="text-[10px] text-[#8e8ea0] leading-snug">Stock khatam hone par bot supplier se khud khareed ke user ko dega. Settings me API key + enable zaroori hai.</p>
-                    </div>
-                  )}
+                        )}
+                        <p className="text-[10px] text-[#8e8ea0] leading-snug">Stock khatam hone par bot mapped suppliers me se jo ₹ me sasta ho (aur stock me ho) usse khud khareed ke user ko dega. Settings me key + enable zaroori hai.</p>
+                      </div>
+                    );
+                  })()}
                   <button
                     onClick={() => handleSaveSupplier(p)}
                     disabled={savingMarginId === p.id}

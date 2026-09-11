@@ -139,45 +139,6 @@ export default function SettingsManager() {
     catch (err) { alert('Error: ' + err.message); }
   };
 
-  // --- m00nshots supplier (auto-buy) ---
-  const [ms, setMs] = useState(null);            // supplier status {enabled, has_key, balance, ...}
-  const [msKey, setMsKey] = useState('');        // pasted API key
-  const [msBusy, setMsBusy] = useState('');
-  const [msMsg, setMsMsg] = useState(null);
-  const [msSearch, setMsSearch] = useState('');
-  const [msProducts, setMsProducts] = useState(null);
-
-  const loadMoonshots = async () => {
-    try { setMs(await adminApi.moonshotsStatus()); } catch (err) { console.error(err); }
-  };
-  useEffect(() => { loadMoonshots(); }, []);
-
-  const msSaveKey = async () => {
-    if (!msKey.trim()) return;
-    try {
-      setMsBusy('key'); setMsMsg(null);
-      const saved = await adminApi.updateSettings({ moonshots_api_key: msKey.trim() });
-      setSettings(saved); setMsKey('');
-      await loadMoonshots();
-      setMsMsg({ ok: true, text: 'API key saved.' });
-    } catch (err) { setMsMsg({ ok: false, text: 'Error: ' + err.message }); }
-    finally { setMsBusy(''); }
-  };
-
-  const msToggle = async (val) => {
-    try { const saved = await adminApi.updateSettings({ moonshots_enabled: val }); setSettings(saved); loadMoonshots(); }
-    catch (err) { alert('Error: ' + err.message); }
-  };
-
-  const msBrowse = async () => {
-    try {
-      setMsBusy('browse'); setMsMsg(null); setMsProducts(null);
-      const res = await adminApi.moonshotsProducts(msSearch.trim());
-      setMsProducts(res.data || []);
-    } catch (err) { setMsMsg({ ok: false, text: 'Error: ' + (err.response?.data?.error || err.message) }); }
-    finally { setMsBusy(''); }
-  };
-
   const handleTestLlm = async () => {
     try {
       setTesting(true);
@@ -465,74 +426,19 @@ export default function SettingsManager() {
           </div>
         </div>
 
-        {/* m00nshots supplier — bot auto-buys a product on demand and delivers it */}
-        <div className="glass-panel rounded-2xl p-5 border border-white/10 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-sm font-bold text-[#ececec] flex items-center gap-2">
-              <DollarSign className="w-4 h-4 text-[#ececec]" />
-              m00nshots Auto-Buy Supplier
-            </h3>
-            {ms && (
-              <div className="flex items-center gap-2 text-[11px]">
-                <span className={`px-2 py-0.5 rounded-full border ${ms.has_key ? 'bg-[#2f2f2f] text-[#ececec] border-white/15' : 'bg-rose-950/40 text-rose-300 border-rose-500/30'}`}>
-                  {ms.has_key ? `Key ${ms.key_mask || 'set'}` : 'No API key'}
-                </span>
-                {ms.has_key && (
-                  <span className={`px-2 py-0.5 rounded-full border ${ms.error ? 'bg-rose-950/40 text-rose-300 border-rose-500/30' : 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30'}`}>
-                    {ms.error ? 'Error' : `Balance: ${ms.balance} ${ms.currency || 'USD'}`}
-                  </span>
-                )}
-                <label className="flex items-center gap-1 text-[#8e8ea0] cursor-pointer">
-                  <input type="checkbox" checked={settings.moonshots_enabled === true} onChange={(e) => msToggle(e.target.checked)} />
-                  enabled
-                </label>
-              </div>
-            )}
-          </div>
-
-          <p className="text-[11px] text-[#8e8ea0] leading-relaxed">
-            Jab kisi product ka source <b>m00nshots</b> ho aur stock khatam ho, bot khud supplier se
-            khareed ke user ko de deta hai. Yahan API key daalo (Telegram bot ka <code>/api</code> command),
-            enable karo, aur <b>Products</b> tab me product ko supplier ki ID se map karo.
-            {ms?.error && <span className="text-rose-300"> · {ms.error}</span>}
-          </p>
-
-          <div className="flex items-center gap-2">
-            <input type="password" value={msKey} onChange={(e) => setMsKey(e.target.value)}
-              placeholder={ms?.has_key ? 'Nayi key daalo (purani replace hogi)' : 'mk_...'}
-              className="flex-1 p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono text-[11px] focus:outline-none focus:border-white/20" />
-            <button type="button" onClick={msSaveKey} disabled={msBusy !== '' || !msKey.trim()}
-              className="px-3 py-2 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/15 text-[#ececec] rounded-xl disabled:opacity-50">
-              {msBusy === 'key' ? 'Saving…' : 'Save key'}
-            </button>
-            <button type="button" onClick={loadMoonshots} disabled={msBusy !== ''}
-              className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">Refresh</button>
-          </div>
-          {msMsg && <div className={`text-[11px] ${msMsg.ok ? 'text-emerald-300' : 'text-rose-300'}`}>{msMsg.text}</div>}
-
-          <div>
-            <label className="block text-[#8e8ea0] mb-1 font-medium text-[11px]">Supplier catalogue — product ki ID dhoondo (Products tab me map karne ke liye)</label>
-            <div className="flex items-center gap-2">
-              <input value={msSearch} onChange={(e) => setMsSearch(e.target.value)} placeholder="e.g. gemini"
-                className="flex-1 p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] text-[11px] focus:outline-none focus:border-white/20" />
-              <button type="button" onClick={msBrowse} disabled={msBusy !== '' || !ms?.has_key}
-                className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">
-                {msBusy === 'browse' ? 'Loading…' : 'Browse'}
-              </button>
-            </div>
-            {msProducts && (
-              <div className="mt-2 max-h-56 overflow-auto rounded-xl border border-white/10 divide-y divide-white/5">
-                {msProducts.length === 0 && <div className="p-2.5 text-[11px] text-[#8e8ea0]">Koi product nahi mila.</div>}
-                {msProducts.map((it) => (
-                  <div key={it.id} className="p-2.5 text-[11px] flex items-center justify-between gap-2">
-                    <span className="text-[#d4d4d4]">{it.icon} {it.name} <span className="text-[#8e8ea0]">· {it.category}</span></span>
-                    <span className="text-[#8e8ea0] whitespace-nowrap">ID <b className="text-[#ececec]">{it.id}</b> · ${it.price} · stock {it.stock}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
+        {/* Auto-buy suppliers — bot buys from the CHEAPEST mapped supplier on demand */}
+        <SupplierCard
+          label="m00nshots Auto-Buy Supplier" keyField="moonshots_api_key" enabledField="moonshots_enabled"
+          statusFn={adminApi.moonshotsStatus} productsFn={adminApi.moonshotsProducts}
+          settings={settings} setSettings={setSettings} keyPlaceholder="mk_..." idLabel="ID"
+          desc="Telegram bot ka /api command se key milti hai. Prices USD me hain (Settings ke USD→INR rate se ₹ me compare hota hai)."
+        />
+        <SupplierCard
+          label="Loot Paglu Auto-Buy Supplier" keyField="lootpaglu_api_key" enabledField="lootpaglu_enabled"
+          statusFn={adminApi.lootpagluStatus} productsFn={adminApi.lootpagluProducts}
+          settings={settings} setSettings={setSettings} keyPlaceholder="LootPaglu_..." idLabel="service id"
+          desc="lootpaglu.in ka X-API-Key. Prices seedha ₹ me. Ek hi product dono suppliers pe ho to bot jo sasta hai wahi se kharidta hai (Products tab me dono IDs map karo)."
+        />
 
         {/* Evolution API (WhatsApp) Webhook Parameters */}
         <div className="glass-panel rounded-2xl p-5 border border-white/10 space-y-4">
@@ -604,6 +510,110 @@ export default function SettingsManager() {
         </div>
 
       </form>
+    </div>
+  );
+}
+
+
+// One card per auto-buy supplier: API key, enable toggle, live balance, catalogue browser.
+function SupplierCard({ label, keyField, enabledField, statusFn, productsFn, settings, setSettings, keyPlaceholder, idLabel, desc }) {
+  const [st, setSt] = useState(null);
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState('');
+  const [msg, setMsg] = useState(null);
+  const [search, setSearch] = useState('');
+  const [items, setItems] = useState(null);
+
+  const load = async () => { try { setSt(await statusFn()); } catch (err) { console.error(err); } };
+  useEffect(() => { load(); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const saveKey = async () => {
+    if (!key.trim()) return;
+    try {
+      setBusy('key'); setMsg(null);
+      const saved = await adminApi.updateSettings({ [keyField]: key.trim() });
+      setSettings(saved); setKey('');
+      await load();
+      setMsg({ ok: true, text: 'API key saved.' });
+    } catch (err) { setMsg({ ok: false, text: 'Error: ' + err.message }); }
+    finally { setBusy(''); }
+  };
+  const toggle = async (val) => {
+    try { const saved = await adminApi.updateSettings({ [enabledField]: val }); setSettings(saved); load(); }
+    catch (err) { alert('Error: ' + err.message); }
+  };
+  const browse = async () => {
+    try { setBusy('browse'); setMsg(null); setItems(null); const res = await productsFn(search.trim()); setItems(res.data || []); }
+    catch (err) { setMsg({ ok: false, text: 'Error: ' + (err.response?.data?.error || err.message) }); }
+    finally { setBusy(''); }
+  };
+  const cur = st?.currency || '';
+  const sym = cur === 'INR' ? '₹' : (cur === 'USD' ? '$' : '');
+
+  return (
+    <div className="glass-panel rounded-2xl p-5 border border-white/10 space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-bold text-[#ececec] flex items-center gap-2">
+          <DollarSign className="w-4 h-4 text-[#ececec]" />
+          {label}
+        </h3>
+        {st && (
+          <div className="flex items-center gap-2 text-[11px]">
+            <span className={`px-2 py-0.5 rounded-full border ${st.has_key ? 'bg-[#2f2f2f] text-[#ececec] border-white/15' : 'bg-rose-950/40 text-rose-300 border-rose-500/30'}`}>
+              {st.has_key ? `Key ${st.key_mask || 'set'}` : 'No API key'}
+            </span>
+            {st.has_key && (
+              <span className={`px-2 py-0.5 rounded-full border ${st.error ? 'bg-rose-950/40 text-rose-300 border-rose-500/30' : 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30'}`}>
+                {st.error ? 'Error' : `Balance: ${sym}${st.balance} ${sym ? '' : cur}`}
+              </span>
+            )}
+            <label className="flex items-center gap-1 text-[#8e8ea0] cursor-pointer">
+              <input type="checkbox" checked={settings[enabledField] === true} onChange={(e) => toggle(e.target.checked)} />
+              enabled
+            </label>
+          </div>
+        )}
+      </div>
+
+      <p className="text-[11px] text-[#8e8ea0] leading-relaxed">
+        {desc}{st?.error && <span className="text-rose-300"> · {st.error}</span>}
+      </p>
+
+      <div className="flex items-center gap-2">
+        <input type="password" value={key} onChange={(e) => setKey(e.target.value)}
+          placeholder={st?.has_key ? 'Nayi key daalo (purani replace hogi)' : keyPlaceholder}
+          className="flex-1 p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] font-mono text-[11px] focus:outline-none focus:border-white/20" />
+        <button type="button" onClick={saveKey} disabled={busy !== '' || !key.trim()}
+          className="px-3 py-2 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/15 text-[#ececec] rounded-xl disabled:opacity-50">
+          {busy === 'key' ? 'Saving…' : 'Save key'}
+        </button>
+        <button type="button" onClick={load} disabled={busy !== ''}
+          className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">Refresh</button>
+      </div>
+      {msg && <div className={`text-[11px] ${msg.ok ? 'text-emerald-300' : 'text-rose-300'}`}>{msg.text}</div>}
+
+      <div>
+        <label className="block text-[#8e8ea0] mb-1 font-medium text-[11px]">Supplier catalogue — product ki {idLabel} dhoondo (Products tab me map karne ke liye)</label>
+        <div className="flex items-center gap-2">
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="e.g. gemini"
+            className="flex-1 p-2.5 bg-[#212121] border border-white/10 rounded-xl text-[#ececec] text-[11px] focus:outline-none focus:border-white/20" />
+          <button type="button" onClick={browse} disabled={busy !== '' || !st?.has_key}
+            className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl disabled:opacity-50">
+            {busy === 'browse' ? 'Loading…' : 'Browse'}
+          </button>
+        </div>
+        {items && (
+          <div className="mt-2 max-h-56 overflow-auto rounded-xl border border-white/10 divide-y divide-white/5">
+            {items.length === 0 && <div className="p-2.5 text-[11px] text-[#8e8ea0]">Koi product nahi mila.</div>}
+            {items.map((it) => (
+              <div key={it.id} className="p-2.5 text-[11px] flex items-center justify-between gap-2">
+                <span className="text-[#d4d4d4]">{it.icon ? `${it.icon} ` : ''}{it.name}{it.category ? <span className="text-[#8e8ea0]"> · {it.category}</span> : null}</span>
+                <span className="text-[#8e8ea0] whitespace-nowrap">{idLabel} <b className="text-[#ececec] font-mono">{it.id}</b> · {it.currency === 'INR' ? '₹' : '$'}{it.price} · stock {it.stock}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -112,7 +112,7 @@ def get_live_product_catalog(user_role: str = "customer", search: str = "") -> s
                 "description": p.description,
                 "customer_selling_price_inr": p.get_customer_price(),
                 "reseller_price_inr": p.get_reseller_price(),
-                "in_stock": stock > 0 or (getattr(p, "source", "stock") == "moonshots" and bool(p.supplier_product_id)),
+                "in_stock": stock > 0 or p.is_supplier_backed(),
                 "available_stock": stock,
             })
         record_tool_call("get_live_product_catalog", True, f"{len(catalog)}/{matched} products")
@@ -148,7 +148,7 @@ def get_product_pricing(product_name_or_slug: str, user_role: str = "customer") 
             "customer_selling_price_inr": product.get_customer_price(),
             "reseller_price_inr": product.get_reseller_price(),
             "available_stock": stock,
-            "in_stock": stock > 0 or (getattr(product, "source", "stock") == "moonshots" and bool(product.supplier_product_id)),
+            "in_stock": stock > 0 or product.is_supplier_backed(),
         })
     finally:
         db.close()

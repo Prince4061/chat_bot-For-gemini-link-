@@ -573,12 +573,31 @@ def list_admin_products():
 
 
 def _apply_supplier_fields(product, data):
-    """Set product.source / supplier_product_id / supplier_max_price from a payload. Returns error str|None."""
+    """Set product.source / supplier ids / preference / ₹ cap from a payload. Returns error str|None."""
     if "source" in data:
         src = str(data["source"]).strip().lower()
-        if src not in ("stock", "moonshots"):
-            return "source must be 'stock' or 'moonshots'"
+        if src == "moonshots":
+            src = "supplier"                     # legacy value from older UI builds
+        if src not in ("stock", "supplier", "lootpaglu"):
+            return "source must be 'stock' or 'supplier'"
         product.source = src
+    if "lootpaglu_service_id" in data:
+        v = str(data["lootpaglu_service_id"] or "").strip()
+        product.lootpaglu_service_id = v[:50] or None
+    if "supplier_preference" in data:
+        pref = str(data["supplier_preference"] or "cheapest").strip().lower()
+        if pref not in ("cheapest", "moonshots", "lootpaglu"):
+            return "supplier_preference must be cheapest | moonshots | lootpaglu"
+        product.supplier_preference = pref
+    if "max_buy_price_inr" in data:
+        v = data["max_buy_price_inr"]
+        if v in (None, ""):
+            product.max_buy_price_inr = None
+        else:
+            try:
+                product.max_buy_price_inr = max(0.0, float(v))
+            except (TypeError, ValueError):
+                return "max_buy_price_inr must be a number"
     if "supplier_product_id" in data:
         v = data["supplier_product_id"]
         if v in (None, ""):
@@ -597,8 +616,8 @@ def _apply_supplier_fields(product, data):
                 product.supplier_max_price = max(0.0, float(v))
             except (TypeError, ValueError):
                 return "supplier_max_price must be a number"
-    if (product.source or "stock") == "moonshots" and not product.supplier_product_id:
-        return "A m00nshots product needs a supplier_product_id"
+    if (product.source or "stock") != "stock" and not product.is_supplier_backed():
+        return "Auto-buy product needs at least one supplier id (m00nshots product id or Loot Paglu service id)"
     return None
 
 
@@ -1162,6 +1181,10 @@ def update_system_settings_api():
             s.moonshots_enabled = bool(data["moonshots_enabled"])
         if "moonshots_api_key" in data and not _is_masked(data["moonshots_api_key"]):
             s.moonshots_api_key = str(data["moonshots_api_key"]).strip()[:200] or None
+        if "lootpaglu_enabled" in data:
+            s.lootpaglu_enabled = bool(data["lootpaglu_enabled"])
+        if "lootpaglu_api_key" in data and not _is_masked(data["lootpaglu_api_key"]):
+            s.lootpaglu_api_key = str(data["lootpaglu_api_key"]).strip()[:200] or None
         if "agent_instructions" in data:
             s.agent_instructions = str(data["agent_instructions"])[:8000]
             llm_changed = True  # trained instructions change the prompt -> rebuild agent
@@ -1343,6 +1366,86 @@ def moonshots_mapped():
             if sid not in seen:                       # several local products may share one supplier id
                 seen[sid] = ms.product_summary(sid, rate, max_age=max_age)
             items[str(local_id)] = seen[sid]
+    return jsonify({"success": True, "usd_to_inr_rate": rate, "count": len(items), "items": items})
+
+
+# =====================================================================
+# Admin: Loot Paglu supplier + cross-supplier (cheapest) quotes
+# =====================================================================
+
+@app.route("/api/admin/lootpaglu/status", methods=["GET"])
+@require_admin
+def lootpaglu_status():
+    import lootpaglu_service as lp
+    return jsonify(lp.status_dict())
+
+
+@app.route("/api/admin/lootpaglu/products", methods=["GET"])
+@require_admin
+@rate_limited(30, "lp_products")
+def lootpaglu_products():
+    import lootpaglu_service as lp
+    search = str(request.args.get("search", "")).strip().lower()
+    fresh = str(request.args.get("fresh", "")).lower() in ("1", "true")
+    try:
+        items = lp.list_products(max_age=0 if fresh else lp.LIST_CACHE_SECONDS)
+    except lp.LootPagluError as exc:
+        return jsonify({"error": exc.message, "code": exc.code}), 502
+    if search:
+        items = [it for it in items if search in (it.get("name") or "").lower() or search in it["id"].lower()]
+    return jsonify({"success": True, "count": len(items), "data": items})
+
+
+@app.route("/api/admin/suppliers/status", methods=["GET"])
+@require_admin
+def suppliers_status():
+    import suppliers
+    return jsonify(suppliers.status_all())
+
+
+@app.route("/api/admin/suppliers/quote", methods=["GET"])
+@require_admin
+@rate_limited(60, "sup_quote")
+def suppliers_quote():
+    """Live quote for ONE supplier ref while the admin types (supplier=moonshots|lootpaglu, ref=...)."""
+    import suppliers
+    name = str(request.args.get("supplier", "")).strip().lower()
+    ref = str(request.args.get("ref", "")).strip()
+    if name not in suppliers.SUPPLIER_ORDER or not ref:
+        return jsonify({"error": "supplier and ref required"}), 400
+    db = get_db()
+    try:
+        rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+    finally:
+        db.close()
+    fresh = str(request.args.get("fresh", "")).lower() in ("1", "true")
+    mod = suppliers._mods()[name]
+    if not mod.is_ready():
+        return jsonify({"success": False, "data": {"supplier": name, "label": suppliers.LABELS[name], "ref": ref, "error": "disabled or no API key"}})
+    info = mod.product_summary(int(ref) if name == "moonshots" and ref.isdigit() else ref, rate, max_age=0 if fresh else 60)
+    info.update({"supplier": name, "label": suppliers.LABELS[name], "ref": ref})
+    return jsonify({"success": info.get("error") is None, "data": info, "usd_to_inr_rate": rate})
+
+
+@app.route("/api/admin/suppliers/mapped", methods=["GET"])
+@require_admin
+@rate_limited(30, "sup_mapped")
+def suppliers_mapped():
+    """For every supplier-backed local product: all supplier quotes in ₹ + which one the bot would
+    buy from right now (cheapest / forced) and why. One call for the whole Products tab."""
+    import suppliers
+    fresh = str(request.args.get("fresh", "")).lower() in ("1", "true")
+    db = get_db()
+    try:
+        rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+        prods = db.query(Product).filter(Product.source != "stock").all()
+        items = {}
+        for prod in prods:
+            if not prod.is_supplier_backed():
+                continue
+            items[str(prod.id)] = suppliers.quotes_with_choice(prod, rate, needed=1, fresh=fresh)
+    finally:
+        db.close()
     return jsonify({"success": True, "usd_to_inr_rate": rate, "count": len(items), "items": items})
 
 

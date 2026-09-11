@@ -110,10 +110,14 @@ class Product(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=utcnow)
 
-    # Auto-buy supplier: "stock" (local InviteLink inventory) | "moonshots" (buy on demand).
+    # Stock source: "stock" (local InviteLink inventory) | "supplier" (auto-buy on demand from the
+    # cheapest mapped supplier). Legacy values "moonshots"/"lootpaglu" force that one supplier.
     source = Column(String(20), default="stock")
-    supplier_product_id = Column(Integer, nullable=True)      # external product id at the supplier
-    supplier_max_price = Column(Float, nullable=True)         # safety cap (supplier currency, USD); skip auto-buy above it
+    supplier_product_id = Column(Integer, nullable=True)      # m00nshots product id
+    lootpaglu_service_id = Column(String(50), nullable=True)  # Loot Paglu service id (e.g. "Paglu_1")
+    supplier_preference = Column(String(20), default="cheapest")   # cheapest | moonshots | lootpaglu
+    max_buy_price_inr = Column(Float, nullable=True)          # never auto-buy above this ₹ price
+    supplier_max_price = Column(Float, nullable=True)         # legacy USD cap (migrated to max_buy_price_inr)
 
     links = relationship("InviteLink", back_populates="product", cascade="all, delete-orphan")
 
@@ -128,6 +132,15 @@ class Product(Base):
             return round(float(self.reseller_price), 2)
         rm = float(self.reseller_margin_percent or 0.0)
         return round(self.base_price + self.base_price * (rm / 100.0), 2)
+
+    def is_supplier_backed(self) -> bool:
+        """Auto-buy product with at least one supplier mapping."""
+        src = self.source or "stock"
+        if src == "stock":
+            return False
+        has_ms = bool(self.supplier_product_id) and src in ("supplier", "moonshots")
+        has_lp = bool((self.lootpaglu_service_id or "").strip()) and src in ("supplier", "lootpaglu")
+        return has_ms or has_lp
 
     def get_available_stock_count(self, session) -> int:
         return session.query(func.count(InviteLink.id)).filter(
@@ -155,9 +168,13 @@ class Product(Base):
             "is_active": self.is_active,
             "source": self.source or "stock",
             "supplier_product_id": self.supplier_product_id,
+            "lootpaglu_service_id": self.lootpaglu_service_id,
+            "supplier_preference": self.supplier_preference or "cheapest",
+            "max_buy_price_inr": self.max_buy_price_inr,
             "supplier_max_price": self.supplier_max_price,
+            "supplier_backed": self.is_supplier_backed(),
             "stock_count": stock,
-            "in_stock": stock > 0 or (self.source == "moonshots"),
+            "in_stock": stock > 0 or self.is_supplier_backed(),
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -428,6 +445,8 @@ class SystemSettings(Base):
     # m00nshots supplier auto-buy: OFF by default. Key stored here (or MOONSHOTS_API_KEY env).
     moonshots_api_key = Column(String(200), nullable=True)
     moonshots_enabled = Column(Boolean, default=False)
+    lootpaglu_api_key = Column(String(200), nullable=True)
+    lootpaglu_enabled = Column(Boolean, default=False)
 
     @staticmethod
     def _mask(value: Optional[str]) -> Optional[str]:
@@ -458,6 +477,9 @@ class SystemSettings(Base):
             "moonshots_enabled": bool(self.moonshots_enabled),
             "moonshots_api_key": self._mask(self.moonshots_api_key),
             "has_moonshots_key": bool(self.moonshots_api_key or Config.MOONSHOTS_API_KEY),
+            "lootpaglu_enabled": bool(self.lootpaglu_enabled),
+            "lootpaglu_api_key": self._mask(self.lootpaglu_api_key),
+            "has_lootpaglu_key": bool(self.lootpaglu_api_key or Config.LOOTPAGLU_API_KEY),
         }
 
 
@@ -731,10 +753,10 @@ def product_is_orderable(db, product: "Product") -> bool:
     """A product can be sold right now: local stock, or it is supplier-backed (auto-buy on demand)."""
     if product.get_available_stock_count(db) > 0:
         return True
-    if (getattr(product, "source", "stock") or "stock") == "moonshots" and product.supplier_product_id:
+    if product.is_supplier_backed():
         try:
-            import moonshots_service as ms
-            return ms.is_ready()
+            import suppliers
+            return suppliers.any_ready(product)
         except Exception:  # noqa: BLE001
             return False
     return False
@@ -1071,64 +1093,18 @@ def _claim_links_in_transaction(
 
 def replenish_supplier_stock(db, product: "Product", needed: int) -> Dict[str, Any]:
     """
-    For a supplier-backed product (source == "moonshots"): if local available stock is short of
-    `needed`, BUY the shortfall from the supplier now and insert the returned credentials as
-    normal available stock. Runs OUTSIDE the claim lock (network I/O) and commits on its own.
-
-    Returns {"bought": n, "order_code": str|None, "error": str|None}. Never raises: on any
-    supplier failure it logs and returns bought=0, so the caller falls back to the normal
-    out-of-stock handling and NO wallet is charged.
+    Supplier-backed product + local stock short of `needed` -> buy the shortfall from the CHEAPEST
+    mapped supplier (m00nshots / Loot Paglu, live ₹ quotes, price cap, stock) and insert the codes
+    as available stock. Runs OUTSIDE the claim lock, commits on its own, never raises:
+    any failure -> bought=0 -> normal out-of-stock handling and NO wallet charge.
+    Returns {"bought", "order_code", "error", "supplier", "unit_price_inr", "reason"}.
     """
-    result: Dict[str, Any] = {"bought": 0, "order_code": None, "error": None}
-    if (getattr(product, "source", "stock") or "stock") != "moonshots":
-        return result
     try:
-        import moonshots_service as ms
-    except Exception:  # noqa: BLE001
-        return result
-    if not ms.is_ready():
-        result["error"] = "supplier disabled or no API key"
-        return result
-    if not product.supplier_product_id:
-        result["error"] = "product not mapped to a supplier product"
-        return result
-
-    available = product.get_available_stock_count(db)
-    shortfall = int(needed) - int(available)
-    if shortfall <= 0:
-        return result
-    shortfall = min(shortfall, Config.MOONSHOTS_MAX_AUTOBUY_QTY)
-
-    try:
-        # Price-cap guard: never auto-buy if the supplier price exceeds the admin's ceiling.
-        if product.supplier_max_price is not None:
-            sup = ms.get_product(product.supplier_product_id)
-            unit = float(sup.get("price") or 0)
-            if unit > float(product.supplier_max_price):
-                result["error"] = f"supplier price {unit} above cap {product.supplier_max_price}"
-                logger.warning("Auto-buy skipped for %s: %s", product.slug, result["error"])
-                return result
-
-        order = ms.place_order(product.supplier_product_id, shortfall)
-        creds = order.get("credentials") or []
-        if not creds:
-            result["error"] = "supplier returned no credentials"
-            logger.error("Auto-buy for %s returned 0 credentials (order %s)", product.slug, order.get("order_code"))
-            return result
-        code = order.get("order_code")
-        for cred in creds:
-            db.add(InviteLink(product_id=product.id, link_or_key=str(cred), status="available",
-                              source="moonshots", notes=f"m00nshots {code}"))
-        db.commit()
-        result["bought"] = len(creds)
-        result["order_code"] = code
-        logger.info("Auto-bought %d unit(s) of %s from supplier (order %s)", len(creds), product.slug, code)
-    except Exception as exc:  # noqa: BLE001  (MoonshotsError or DB error)
-        db.rollback()
-        msg = getattr(exc, "message", str(exc))
-        result["error"] = msg
-        logger.exception("replenish_supplier_stock failed for %s: %s", product.slug, msg)
-    return result
+        import suppliers
+        return suppliers.replenish(db, product, needed)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("replenish_supplier_stock crashed")
+        return {"bought": 0, "order_code": None, "error": str(exc)[:200], "supplier": None, "unit_price_inr": None, "reason": None}
 
 
 def ensure_fresh_stock(db, product_id: int, count: int = 1, max_checks: int = 12,
@@ -1596,8 +1572,28 @@ def init_db() -> None:
         _migrate_reseller_price_to_margin(db)
         _migrate_credits_to_wallet(db)
         _backfill_google_checker_enabled(db)
+        _migrate_supplier_fields(db)
     finally:
         db.close()
+
+
+def _migrate_supplier_fields(db) -> None:
+    """source='moonshots' -> 'supplier' (cheapest of mapped) and USD cap -> ₹ cap, once."""
+    try:
+        rate = float(get_settings(db).usd_to_inr_rate or 83.0)
+        n_src = (db.query(Product).filter(Product.source == "moonshots")
+                 .update({"source": "supplier"}, synchronize_session=False))
+        n_cap = 0
+        for prod in db.query(Product).filter(Product.supplier_max_price.isnot(None), Product.max_buy_price_inr.is_(None)).all():
+            prod.max_buy_price_inr = round(float(prod.supplier_max_price) * rate, 2)
+            prod.supplier_max_price = None
+            n_cap += 1
+        if n_src or n_cap:
+            db.commit()
+            logger.info("Migrated supplier fields: %d source rows, %d price caps -> INR", n_src, n_cap)
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.warning("supplier field migration skipped", exc_info=True)
 
 
 def _backfill_google_checker_enabled(db) -> None:
