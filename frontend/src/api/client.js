@@ -128,6 +128,7 @@ export const adminApi = {
   recheckInventory: async (productId = '') =>
     (await api.post('/admin/inventory/recheck', productId ? { product_id: parseInt(productId) } : {})).data,
   restoreInventoryItem: async (id) => (await api.post(`/admin/inventory/${id}/restore`)).data,
+  inventoryDuplicates: async () => (await api.get('/admin/inventory/duplicates')).data,
 
   getResellers: async () => (await api.get('/admin/resellers')).data,
   createReseller: async (resellerData) => (await api.post('/admin/resellers', resellerData)).data,

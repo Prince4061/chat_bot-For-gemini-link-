@@ -40,11 +40,11 @@ def _mock(monkeypatch, *, ms_price_usd=None, ms_stock=10, lp_price=None, lp_stoc
 
     def ms_order(pid, qty=1):
         calls["orders"].append(("moonshots", pid, qty))
-        return {"order_code": "ORD-MS", "credentials": [f"ms{i}@x:pw" for i in range(qty)]}
+        return {"order_code": "ORD-MS", "credentials": [f"ms{i}-{uuid.uuid4().hex[:6]}@x:pw" for i in range(qty)]}
 
     def lp_order(sid, qty=1):
         calls["orders"].append(("lootpaglu", sid, qty))
-        return {"order_code": "api_lp_1", "credentials": [f"LP-CODE-{i}" for i in range(qty)]}
+        return {"order_code": "api_lp_1", "credentials": [f"LP-CODE-{i}-{uuid.uuid4().hex[:6]}" for i in range(qty)]}
 
     monkeypatch.setattr(ms, "place_order", ms_order)
     monkeypatch.setattr(lp, "place_order", lp_order)
@@ -60,7 +60,7 @@ def test_cheapest_in_inr_wins_lootpaglu(db, monkeypatch):
     assert res["bought"] == 1 and res["supplier"] == "lootpaglu" and res["unit_price_inr"] == 50.0
     assert calls["orders"] == [("lootpaglu", "Paglu_1", 1)]
     row = db.query(dbm.InviteLink).filter_by(product_id=p.id).first()
-    assert row.source == "lootpaglu" and row.link_or_key == "LP-CODE-0" and "Loot Paglu" in row.notes
+    assert row.source == "lootpaglu" and row.link_or_key.startswith("LP-CODE-0") and "Loot Paglu" in row.notes
     assert "cheapest" in res["reason"]
 
 
@@ -136,7 +136,7 @@ def test_reseller_claim_buys_from_cheapest_and_delivers(db, fresh_reseller, monk
     p.base_price = 1; db.commit()
     _mock(monkeypatch, ms_price_usd=1.0, lp_price=20.0)
     res = dbm.process_reseller_claim_for(fresh_reseller, p, 2, db)
-    assert res["success"] and res["links"] == ["LP-CODE-0", "LP-CODE-1"]
+    assert res["success"] and len(res["links"]) == 2 and all(l.startswith("LP-CODE-") for l in res["links"])
     assert res["supplier_autobuy"]["supplier"] == "lootpaglu"
 
 
@@ -266,7 +266,7 @@ def test_ek_aur_claims_the_same_product_again_without_llm(db, fresh_reseller, mo
     sid = f"wa_rep_{fresh_reseller.phone}"
     first = agent_core.run_deep_agent_chat(sid, f"{p.name.lower()} link do", **kw)     # named product -> tool path
     # (fake LLM never calls tools, so force the first claim through the rule engine)
-    if "ms0@x:pw" not in first["message"]:
+    if "@x:pw" not in first["message"]:
         monkeypatch.setattr(agent_core, "get_deep_agent", lambda: None)
         first = agent_core.run_deep_agent_chat(sid, f"{p.name.lower()} link do", **kw)
         monkeypatch.setattr(agent_core, "get_deep_agent", lambda: _Hallucinating())
@@ -326,3 +326,73 @@ def test_dry_run_explains_verdict(client, admin_headers, db, monkeypatch):
     db.add(q); db.commit()
     d3 = client.get(f"/api/admin/suppliers/dry-run/{q.id}", headers=admin_headers).get_json()
     assert not d3["supplier_backed"] and "auto-buy OFF" in d3["verdict"]
+
+
+# ---- duplicate guard: the "same expired link 3 times, charged 3 times" bug ---------------------------
+
+def test_supplier_duplicate_link_is_never_stocked_and_next_supplier_is_tried(db, monkeypatch):
+    p = _product(db)
+    calls = _mock(monkeypatch, ms_price_usd=1.0, lp_price=20.0)              # LP cheapest
+    # LP keeps returning the SAME link every order; we already delivered it once.
+    db.add(dbm.InviteLink(product_id=p.id, link_or_key="https://serviceactivation.google.com/subscription/new/SAME",
+                          status="claimed", claimed_by_type="reseller", claimed_by_id="9999999999")); db.commit()
+    monkeypatch.setattr(lp, "place_order", lambda sid, qty=1: (calls["orders"].append(("lootpaglu", sid, qty)) or
+                        {"order_code": "api_dup", "credentials": ["https://serviceactivation.google.com/subscription/new/SAME"]}))
+    res = dbm.replenish_supplier_stock(db, p, 1)
+    assert res["supplier"] == "moonshots" and res["bought"] == 1             # fell through to m00nshots
+    assert "DUPLICATE" in res["reason"]
+    assert db.query(dbm.InviteLink).filter_by(link_or_key="https://serviceactivation.google.com/subscription/new/SAME").count() == 1
+
+
+def test_all_suppliers_duplicate_means_no_stock_and_no_charge(db, fresh_reseller, monkeypatch):
+    p = _product(db, lp_id=None); p.base_price = 1; db.commit()
+    _mock(monkeypatch, ms_price_usd=1.0, lp_ready=False)
+    db.add(dbm.InviteLink(product_id=p.id, link_or_key="DUP-TOKEN", status="claimed")); db.commit()
+    monkeypatch.setattr(ms, "place_order", lambda pid, qty=1: {"order_code": "ORD-D", "credentials": ["DUP-TOKEN"]})
+    before = db.query(dbm.Reseller).get(fresh_reseller.id).wallet_balance
+    res = dbm.process_reseller_claim_for(fresh_reseller, p, 1, db)
+    assert res["success"] is False and res["error"] == "OUT_OF_STOCK"
+    assert "DUPLICATE" in res["supplier_autobuy"]["error"]
+    assert db.query(dbm.Reseller).get(fresh_reseller.id).wallet_balance == before      # not charged
+
+
+def test_partial_duplicates_keep_only_new_links(db, monkeypatch):
+    p = _product(db, lp_id=None)
+    _mock(monkeypatch, ms_price_usd=1.0, lp_ready=False)
+    db.add(dbm.InviteLink(product_id=p.id, link_or_key="OLD-1", status="claimed")); db.commit()
+    monkeypatch.setattr(ms, "place_order", lambda pid, qty=1: {"order_code": "ORD-P", "credentials": ["OLD-1", "NEW-2", "NEW-2"]})
+    res = dbm.replenish_supplier_stock(db, p, 2)
+    assert res["bought"] == 1 and res["duplicates"] == 1
+    assert p.get_available_stock_count(db) == 1
+
+
+def test_pre_existing_duplicate_rows_are_never_delivered(db, fresh_reseller, monkeypatch):
+    """Rows stocked before this fix: two rows with the same text - the second must never go out."""
+    slug = f"dupl-{uuid.uuid4().hex[:6]}"
+    p = dbm.Product(name=f"Dupl {slug}", slug=slug, base_price=1, margin_percent=0, reseller_margin_percent=0)
+    db.add(p); db.commit()
+    db.add(dbm.InviteLink(product_id=p.id, link_or_key="https://serviceactivation.google.com/subscription/new/TWICE", status="claimed"))
+    db.add(dbm.InviteLink(product_id=p.id, link_or_key="https://serviceactivation.google.com/subscription/new/TWICE"))   # stocked again
+    db.add(dbm.InviteLink(product_id=p.id, link_or_key="https://serviceactivation.google.com/subscription/new/FRESHONE"))
+    db.commit()
+    import link_checker
+    monkeypatch.setattr(link_checker, "check_link_freshness_detail", lambda u, allow_browser=True: ("unknown", "http"))
+    res = dbm.process_reseller_claim_for(fresh_reseller, p, 1, db)
+    assert res["success"] and res["links"] == ["https://serviceactivation.google.com/subscription/new/FRESHONE"]
+    parked = db.query(dbm.InviteLink).filter_by(link_or_key="https://serviceactivation.google.com/subscription/new/TWICE", status="used").first()
+    assert parked and parked.health == "duplicate"
+
+
+def test_duplicate_deliveries_report(client, admin_headers, db):
+    slug = f"rep-{uuid.uuid4().hex[:6]}"
+    p = dbm.Product(name=f"Rep {slug}", slug=slug, base_price=1, margin_percent=0, reseller_margin_percent=0)
+    db.add(p); db.commit()
+    tok = f"https://serviceactivation.google.com/subscription/new/{uuid.uuid4().hex}"
+    for who in ("9111111111", "9111111111", "9222222222"):
+        db.add(dbm.InviteLink(product_id=p.id, link_or_key=tok, status="claimed", claimed_by_type="reseller",
+                              claimed_by_id=who, claimed_at=dbm.utcnow()))
+    db.commit()
+    r = client.get("/api/admin/inventory/duplicates", headers=admin_headers).get_json()
+    item = next(i for i in r["items"] if i["product"] == p.name)
+    assert item["times_delivered"] == 3 and item["deliveries"][0]["first"] is True
+    assert [d["claimed_by_id"] for d in item["deliveries"][1:]] == ["9111111111", "9222222222"]   # refund these

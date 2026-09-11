@@ -29,6 +29,8 @@ export default function InventoryManager() {
   const [uploadErr, setUploadErr] = useState('');
   const [rechecking, setRechecking] = useState(false);
   const [checker, setChecker] = useState(null);   // Google link checker status (verifies Gemini links)
+  const [dups, setDups] = useState(null);         // duplicate-delivery report (who to refund)
+  const [dupsBusy, setDupsBusy] = useState(false);
 
   const loadData = async () => {
     adminApi.googleCheckerStatus().then(setChecker).catch(() => setChecker(null));
@@ -83,6 +85,12 @@ export default function InventoryManager() {
     } finally {
       setUploading(false);
     }
+  };
+
+  const loadDuplicates = async () => {
+    try { setDupsBusy(true); setDups(await adminApi.inventoryDuplicates()); }
+    catch (err) { alert('Error: ' + err.message); }
+    finally { setDupsBusy(false); }
   };
 
   const handleRecheck = async () => {
@@ -153,6 +161,15 @@ export default function InventoryManager() {
             {rechecking ? 'Checking…' : 'Recheck freshness'}
           </button>
           <button
+            onClick={loadDuplicates}
+            disabled={dupsBusy}
+            title="Same link do baar deliver hui? (supplier duplicate / double upload) - kisko refund karna hai"
+            className="px-3 py-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl transition-colors text-xs flex items-center gap-1.5 disabled:opacity-50"
+          >
+            <Flame className="w-3.5 h-3.5" />
+            {dupsBusy ? 'Checking…' : 'Duplicate deliveries'}
+          </button>
+          <button
             onClick={loadData}
             className="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] text-[#d4d4d4] rounded-xl transition-colors text-xs flex items-center gap-1.5"
           >
@@ -176,6 +193,32 @@ export default function InventoryManager() {
               {!checker.session_present && ' (throwaway Gmail se `python google_checker.py login` → JSON paste → Connect)'}
               {checker.installed && !checker.browser_ok && ' (VPS: python3 -m playwright install --with-deps chromium)'}.
             </span>
+          )}
+        </div>
+      )}
+
+      {/* Duplicate deliveries report */}
+      {dups && (
+        <div className={`rounded-2xl px-4 py-3 border text-xs space-y-2 ${dups.count ? 'bg-rose-950/30 border-rose-500/30 text-rose-100' : 'bg-emerald-950/30 border-emerald-500/30 text-emerald-200'}`}>
+          {dups.count === 0 ? (
+            <div>✅ Koi duplicate delivery nahi — har link sirf ek baar gayi hai.</div>
+          ) : (
+            <>
+              <div><b>🚨 {dups.count} link(s) ek se zyada baar deliver hui.</b> Pehli delivery sahi thi; baaki buyers ko refund karo (Resellers tab → wallet adjust) aur supplier se dispute karo.</div>
+              {dups.items.map((it, i) => (
+                <div key={i} className="rounded-lg bg-black/25 p-2">
+                  <div className="font-mono text-[11px] text-[#ececec] break-all">{it.link_preview}</div>
+                  <div className="text-[11px] opacity-90">{it.product} · {it.times_delivered}× delivered</div>
+                  <ul className="mt-1 space-y-0.5 text-[11px]">
+                    {it.deliveries.map((d) => (
+                      <li key={d.link_id} className={d.first ? 'opacity-70' : 'font-semibold'}>
+                        {d.first ? '✓ pehli (valid)' : '↩ REFUND'} — {d.claimed_by_type} {d.claimed_by_id} · {d.claimed_at ? new Date(d.claimed_at).toLocaleString() : ''} · source {d.source}{d.order_id ? ` · ${d.order_id}` : ''}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </>
           )}
         </div>
       )}

@@ -210,17 +210,45 @@ def replenish(db, product, needed: int) -> Dict[str, Any]:
                 logger.warning("Auto-buy at %s failed for %s (%s) - trying next supplier", best["supplier"], product.slug, msg)
                 continue
             creds = order.get("credentials") or []
-            if not creds:
-                attempts.append(f"{best['label']}: returned no credentials (order {order.get('order_code')})")
-                logger.error("Auto-buy for %s at %s returned 0 credentials (order %s)", product.slug, best["supplier"], order.get("order_code"))
-                continue
             code = order.get("order_code")
+            if not creds:
+                attempts.append(f"{best['label']}: returned no credentials (order {code})")
+                logger.error("Auto-buy for %s at %s returned 0 credentials (order %s)", product.slug, best["supplier"], code)
+                continue
+            # DUPLICATE GUARD: a supplier that hands back a link we already hold/delivered (same
+            # token) is selling us the same thing twice. Never stock it, never charge a buyer for it.
+            fresh_creds, dupes = [], []
+            seen_in_batch = set()
             for cred in creds:
-                db.add(InviteLink(product_id=product.id, link_or_key=str(cred), status="available",
+                c = str(cred).strip()
+                if not c or c in seen_in_batch:
+                    continue
+                seen_in_batch.add(c)
+                if db.query(InviteLink.id).filter(InviteLink.link_or_key == c).first():
+                    dupes.append(c)
+                else:
+                    fresh_creds.append(c)
+            if dupes:
+                result["duplicates"] = len(dupes)
+                result["duplicate_order_code"] = code
+                logger.error("Auto-buy for %s at %s (order %s): %d of %d credential(s) were ALREADY in our inventory - "
+                             "supplier returned duplicate/reused links; not stocked. Dispute this order with the supplier.",
+                             product.slug, best["supplier"], code, len(dupes), len(creds))
+            if not fresh_creds:
+                attempts.append(f"{best['label']}: returned {len(dupes)} DUPLICATE link(s) we already had (order {code}) - not stocked")
+                continue
+            for c in fresh_creds:
+                db.add(InviteLink(product_id=product.id, link_or_key=c, status="available",
                                   source=best["supplier"], notes=f"{best['label']} {code} @₹{float(best['price_inr']):.2f}"))
             db.commit()
-            result.update(bought=len(creds), order_code=code, supplier=best["supplier"],
+            result.update(bought=len(fresh_creds), order_code=code, supplier=best["supplier"],
                           unit_price_inr=float(best["price_inr"]))
+            if dupes:
+                result["reason"] = (reason + f" | WARNING: {len(dupes)} duplicate link(s) from {best['label']} discarded (order {code})")
+                try:
+                    alert_admin_duplicates(product, best["label"], code, len(dupes), len(creds))
+                except Exception:  # noqa: BLE001
+                    pass
             if attempts:
                 result["reason"] = reason + " | fell back after: " + "; ".join(attempts)
             logger.info("Auto-bought %d x %s from %s (order %s) - %s", len(creds), product.slug, best["supplier"], code, result["reason"])
@@ -290,6 +318,28 @@ def alert_admin_autobuy_failure(product, result: Dict[str, Any]) -> bool:
             logger.warning("admin auto-buy alert could not be sent", exc_info=True)
 
     threading.Thread(target=_send, name="autobuy-alert", daemon=True).start()
+    return True
+
+
+def alert_admin_duplicates(product, supplier_label: str, order_code, n_dupes: int, n_total: int) -> bool:
+    """Supplier returned link(s) we already had -> tell the admin (this is money lost at the supplier)."""
+    import threading
+    number = _admin_number()
+    if not number:
+        return False
+    text = ("🚨 *Supplier ne DUPLICATE link bheja* — " + product.name + "\n"
+            f"{supplier_label} order {order_code}: {n_dupes}/{n_total} link(s) pehle se hamare stock/delivery me the (same token).\n"
+            "Bot ne inhe stock NAHI kiya aur kisi buyer ko nahi diya. Supplier se is order ka refund maango.\n"
+            "Check: Admin → Products → is product ka mapped supplier ID sahi hai? (Test auto-buy me naam dekho)")
+
+    def _send():
+        try:
+            from evolution_service import send_whatsapp_message
+            send_whatsapp_message(remote_jid=number, message_text=text)
+        except Exception:  # noqa: BLE001
+            logger.warning("admin duplicate alert could not be sent", exc_info=True)
+
+    threading.Thread(target=_send, name="dup-alert", daemon=True).start()
     return True
 
 

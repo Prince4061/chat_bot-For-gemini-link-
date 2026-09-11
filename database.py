@@ -1145,6 +1145,22 @@ def ensure_fresh_stock(db, product_id: int, count: int = 1, max_checks: int = 12
         if not link:
             break
         last_id = link.id
+        # DUPLICATE GUARD at delivery time: if this exact link text was already handed out (or is
+        # stocked twice), never deliver it again - park this row as 'used' (health=duplicate).
+        twin = (db.query(InviteLink.id)
+                .filter(InviteLink.link_or_key == link.link_or_key, InviteLink.id != link.id,
+                        InviteLink.status.in_(["claimed", "used"]))
+                .first())
+        if twin:
+            link.status = "used"
+            link.health = "duplicate"
+            link.health_checked_at = utcnow()
+            link.notes = ((link.notes or "") + f" | duplicate of link #{twin[0]} - not delivered").strip(" |")
+            marked_used += 1
+            db.commit()
+            logger.warning("Link #%s for product %s is a duplicate of already-delivered #%s - parked, not delivered",
+                           link.id, product_id, twin[0])
+            continue
         if not is_checkable(link.link_or_key):
             passed_ids.append(link.id)      # can't verify this type -> hand it out as-is
             continue
@@ -1177,6 +1193,31 @@ def ensure_fresh_stock(db, product_id: int, count: int = 1, max_checks: int = 12
     return {"checked": checked, "marked_used": marked_used, "method": method,
             "front_health": (front[0] if front else None) or "unchecked",
             "checked_ids": checked_ids, "browser_fresh_ids": browser_fresh_ids, "passed_ids": passed_ids}
+
+
+def find_duplicate_deliveries(db) -> List[Dict[str, Any]]:
+    """Identical link text delivered more than once (claimed/used rows sharing the same token):
+    who got it, when, and which product - so the admin can refund the later buyers."""
+    from sqlalchemy import func as _f
+    dup_texts = [r[0] for r in (db.query(InviteLink.link_or_key)
+                                .filter(InviteLink.status.in_(["claimed", "used"]))
+                                .group_by(InviteLink.link_or_key)
+                                .having(_f.count(InviteLink.id) > 1).all())]
+    out: List[Dict[str, Any]] = []
+    for text_ in dup_texts:
+        rows = (db.query(InviteLink).filter(InviteLink.link_or_key == text_)
+                .order_by(InviteLink.claimed_at.asc().nullslast(), InviteLink.id.asc()).all())
+        delivered = [r for r in rows if r.status == "claimed"]
+        out.append({
+            "link_preview": (text_[:48] + "…") if len(text_) > 48 else text_,
+            "times_delivered": len(delivered),
+            "product": rows[0].product.name if rows and rows[0].product else None,
+            "deliveries": [{"link_id": r.id, "claimed_by_type": r.claimed_by_type, "claimed_by_id": r.claimed_by_id,
+                            "claimed_at": r.claimed_at.isoformat() if r.claimed_at else None, "order_id": r.order_id,
+                            "source": r.source or "stock", "first": i == 0}
+                           for i, r in enumerate(delivered)],
+        })
+    return out
 
 
 def _link_verification(agg: Dict[str, Any], links: List["InviteLink"]) -> Dict[str, Any]:

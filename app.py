@@ -828,6 +828,19 @@ def bulk_upload_links():
         db.close()
 
 
+@app.route("/api/admin/inventory/duplicates", methods=["GET"])
+@require_admin
+def inventory_duplicates():
+    """Same link delivered more than once (supplier duplicates / double upload): who to refund."""
+    from database import find_duplicate_deliveries
+    db = get_db()
+    try:
+        items = find_duplicate_deliveries(db)
+        return jsonify({"count": len(items), "items": items})
+    finally:
+        db.close()
+
+
 @app.route("/api/admin/inventory/recheck", methods=["POST"])
 @require_admin
 def recheck_inventory():
