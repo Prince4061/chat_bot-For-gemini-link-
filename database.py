@@ -1302,6 +1302,7 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
                     "error": "OUT_OF_STOCK",
                     "message": f"Only {available} link(s) currently in stock for {product.name}. Requested {quantity}. No money was deducted.",
                     "available_stock": available,
+                    "supplier_autobuy": supplier_buy,     # admin-visible WHY (never shown to the buyer)
                 }
 
             # 3. Ledger entries (one per link).
@@ -1406,9 +1407,10 @@ def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "cust
             "message": "This payment reference has already been used for another order. Please share the correct UTR.",
         }
 
-    # Supplier auto-buy: top up stock from m00nshots on demand for supplier-backed products.
+    # Supplier auto-buy: top up stock from the cheapest supplier on demand for supplier-backed products.
+    supplier_buy: Dict[str, Any] = {"bought": 0, "error": None}
     if order.product:
-        replenish_supplier_stock(db, order.product, 1)
+        supplier_buy = replenish_supplier_stock(db, order.product, 1)
 
     # Verify freshness lazily before delivering, so customers only get fresh links.
     agg: Dict[str, Any] = {"checked": 0, "marked_used": 0, "method": "none"}
@@ -1437,6 +1439,7 @@ def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "cust
                         f"Payment reference {ref} recorded for order {order.id}, but stock is momentarily exhausted. "
                         "The admin has been notified and will deliver your link shortly."
                     ),
+                    "supplier_autobuy": supplier_buy,
                 }
             link = links[0]
             order.payment_ref = ref or order.payment_ref
@@ -1455,6 +1458,7 @@ def fulfill_order(order: CustomerOrder, payment_ref: str, db, actor: str = "cust
             "link": link.link_or_key,
             "payment_ref": order.payment_ref,
             "link_verification": _link_verification(agg, [link]),
+            "supplier_autobuy": supplier_buy,
             "message": "Payment confirmed and single-use link delivered.",
         }
     except Exception as exc:

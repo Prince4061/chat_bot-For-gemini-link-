@@ -621,7 +621,20 @@ def _reseller_prices_lines(db, reseller: Reseller, limit: int = 8) -> str:
     return "\n".join(f"• {p.name.split(' (')[0]} — {reseller.money(product_charge_for(db, reseller, p))}" for p in prods)
 
 
+def _record_autobuy(res: Dict[str, Any]) -> None:
+    """Admin-visible `auto_buy` tool-call (Bot Tester chip + log) - which supplier, or WHY it failed."""
+    sb = (res or {}).get("supplier_autobuy") or {}
+    if not sb or (not sb.get("bought") and not sb.get("error")):
+        return   # not a supplier-backed product / nothing attempted
+    if sb.get("bought"):
+        record_tool_call("auto_buy", True, f"{sb.get('supplier')} x{sb.get('bought')} @₹{sb.get('unit_price_inr')} - {sb.get('reason')}")
+    else:
+        record_tool_call("auto_buy", False, f"{sb.get('error')}")
+        logger.warning("Auto-buy did not deliver: %s", sb.get("error"))
+
+
 def _reseller_claim_reply(res: Dict[str, Any]) -> str:
+    _record_autobuy(res)
     if not res.get("success"):
         return f"❌ **Reseller operation failed:** {res.get('message')}"
     return (
@@ -824,6 +837,7 @@ def handle_rule_based_fallback(user_message: str, session_rec: ChatSessionRecord
         if not is_plausible_payment_ref(ref):
             return f"📲 Please share the **12-digit UTR / transaction ID** from your UPI app for order **{pending.id}** so I can deliver your link."
         res = fulfill_order(pending, ref, db, actor="rule_engine")
+        _record_autobuy(res)
         if not res.get("success"):
             return f"⚠️ {res.get('message')}"
         return (

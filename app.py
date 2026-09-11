@@ -1388,6 +1388,8 @@ def lootpaglu_products():
     search = str(request.args.get("search", "")).strip().lower()
     fresh = str(request.args.get("fresh", "")).lower() in ("1", "true")
     try:
+        if str(request.args.get("raw", "")).lower() in ("1", "true"):
+            return jsonify({"success": True, "raw": lp.raw_products()[:20]})   # admin debug: real field names
         items = lp.list_products(max_age=0 if fresh else lp.LIST_CACHE_SECONDS)
     except lp.LootPagluError as exc:
         return jsonify({"error": exc.message, "code": exc.code}), 502

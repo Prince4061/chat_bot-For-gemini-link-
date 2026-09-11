@@ -85,15 +85,38 @@ def quotes_for(product, usd_to_inr: float, fresh: bool = False) -> List[Dict[str
         for k in ("name", "price", "currency", "price_inr", "stock", "in_stock", "error", "code"):
             if k in summ:
                 q[k] = summ[k]
+        # A ₹0 / missing price is never a bargain — it is missing data. Refuse to buy on it.
+        if not q.get("error") and (q.get("price_inr") is None or float(q.get("price_inr") or 0) <= 0):
+            q["error"] = "price unavailable at supplier (₹0 / missing) - not safe to auto-buy"
+            q["code"] = "no_price"
         quotes.append(q)
     return quotes
+
+
+def rank(quotes: List[Dict[str, Any]], needed: int, preference: str = "cheapest",
+         cap_inr: Optional[float] = None) -> Tuple[List[Dict[str, Any]], str]:
+    """All usable quotes, best first (cheapest ₹ with enough stock, then cheapest with any stock)."""
+    best, reason = choose(quotes, needed, preference, cap_inr)
+    if best is None:
+        return [], reason
+    needed = max(1, int(needed or 1))
+    usable = [q for q in quotes if q.get("ready") and not q.get("error") and q.get("price_inr") is not None
+              and float(q["price_inr"]) > 0 and int(q.get("stock") or 0) >= 1]
+    if preference in ("moonshots", "lootpaglu"):
+        usable = [q for q in usable if q["supplier"] == preference]
+    if cap_inr is not None:
+        usable = [q for q in usable if float(q["price_inr"]) <= cap_inr]
+    ordered = sorted(usable, key=lambda q: (0 if int(q.get("stock") or 0) >= needed else 1,
+                                            float(q["price_inr"]), SUPPLIER_ORDER.index(q["supplier"])))
+    return ordered, reason
 
 
 def choose(quotes: List[Dict[str, Any]], needed: int, preference: str = "cheapest",
            cap_inr: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], str]:
     """Pick the supplier to buy from. Returns (quote|None, reason)."""
     needed = max(1, int(needed or 1))
-    usable = [q for q in quotes if q.get("ready") and not q.get("error") and q.get("price_inr") is not None]
+    usable = [q for q in quotes if q.get("ready") and not q.get("error") and q.get("price_inr") is not None
+              and float(q["price_inr"]) > 0]
     if not usable:
         errs = "; ".join(f"{q['label']}: {q.get('error')}" for q in quotes if q.get("error")) or "no supplier mapped"
         return None, errs
@@ -162,28 +185,44 @@ def replenish(db, product, needed: int) -> Dict[str, Any]:
     try:
         rate = float(get_settings(db).usd_to_inr_rate or 83.0)
         quotes = quotes_for(product, rate, fresh=True)          # re-read price/stock right before spending
-        best, reason = choose(quotes, shortfall, getattr(product, "supplier_preference", None) or "cheapest",
-                              price_cap_inr(product, rate))
+        ordered, reason = rank(quotes, shortfall, getattr(product, "supplier_preference", None) or "cheapest",
+                               price_cap_inr(product, rate))
         result["reason"] = reason
-        if best is None:
+        result["quotes"] = [{k: q.get(k) for k in ("supplier", "label", "price_inr", "stock", "error")} for q in quotes]
+        if not ordered:
             result["error"] = reason
             logger.warning("Auto-buy skipped for %s: %s", product.slug, reason)
             return result
-        qty = min(shortfall, max(1, int(best.get("stock") or shortfall)))
-        order = buy(best["supplier"], best["ref"], qty)
-        creds = order.get("credentials") or []
-        if not creds:
-            result["error"] = f"{best['label']} returned no credentials"
-            logger.error("Auto-buy for %s at %s returned 0 credentials (order %s)", product.slug, best["supplier"], order.get("order_code"))
+        attempts: List[str] = []
+        # Try the best supplier first; if the PURCHASE itself fails (balance, stock race, 5xx),
+        # fall through to the next one instead of telling the buyer "out of stock".
+        for best in ordered:
+            qty = min(shortfall, max(1, int(best.get("stock") or shortfall)))
+            try:
+                order = buy(best["supplier"], best["ref"], qty)
+            except Exception as exc:  # noqa: BLE001
+                msg = getattr(exc, "message", str(exc))
+                attempts.append(f"{best['label']}: {msg}")
+                logger.warning("Auto-buy at %s failed for %s (%s) - trying next supplier", best["supplier"], product.slug, msg)
+                continue
+            creds = order.get("credentials") or []
+            if not creds:
+                attempts.append(f"{best['label']}: returned no credentials (order {order.get('order_code')})")
+                logger.error("Auto-buy for %s at %s returned 0 credentials (order %s)", product.slug, best["supplier"], order.get("order_code"))
+                continue
+            code = order.get("order_code")
+            for cred in creds:
+                db.add(InviteLink(product_id=product.id, link_or_key=str(cred), status="available",
+                                  source=best["supplier"], notes=f"{best['label']} {code} @₹{float(best['price_inr']):.2f}"))
+            db.commit()
+            result.update(bought=len(creds), order_code=code, supplier=best["supplier"],
+                          unit_price_inr=float(best["price_inr"]))
+            if attempts:
+                result["reason"] = reason + " | fell back after: " + "; ".join(attempts)
+            logger.info("Auto-bought %d x %s from %s (order %s) - %s", len(creds), product.slug, best["supplier"], code, result["reason"])
             return result
-        code = order.get("order_code")
-        for cred in creds:
-            db.add(InviteLink(product_id=product.id, link_or_key=str(cred), status="available",
-                              source=best["supplier"], notes=f"{best['label']} {code} @₹{float(best['price_inr']):.2f}"))
-        db.commit()
-        result.update(bought=len(creds), order_code=code, supplier=best["supplier"],
-                      unit_price_inr=float(best["price_inr"]))
-        logger.info("Auto-bought %d x %s from %s (order %s) - %s", len(creds), product.slug, best["supplier"], code, reason)
+        result["error"] = "every supplier failed: " + "; ".join(attempts)
+        logger.error("Auto-buy for %s failed at all suppliers: %s", product.slug, result["error"])
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         msg = getattr(exc, "message", str(exc))

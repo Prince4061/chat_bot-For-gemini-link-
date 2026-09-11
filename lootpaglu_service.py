@@ -130,18 +130,51 @@ def list_products(max_age: int = LIST_CACHE_SECONDS) -> List[Dict[str, Any]]:
     raw = _request("GET", "/api/v1/products").get("services", []) or []
     items = []
     for svc in raw:
-        stock = int(svc.get("available_stock") or 0)
-        items.append({
-            "id": str(svc.get("service_id") or ""),
-            "name": svc.get("name"),
-            "price": float(((svc.get("prices") or {}).get("upiPrice")) or 0),
-            "price_crypto": float(((svc.get("prices") or {}).get("cryptoPrice")) or 0),
-            "currency": CURRENCY,
-            "stock": stock, "in_stock": stock > 0,
-            "requires_verification": bool(svc.get("requires_shein_verification")),
-        })
+        items.append(_normalise_service(svc))
     _LIST_CACHE.update(ts=time.time(), items=items)
     return items
+
+
+def _num(v) -> float:
+    try:
+        return float(str(v).replace(",", "").replace("₹", "").replace("Rs", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _first_price(d: Dict[str, Any], keys) -> float:
+    for k in keys:
+        if k in d and _num(d.get(k)) > 0:
+            return _num(d.get(k))
+    return 0.0
+
+
+def _normalise_service(svc: Dict[str, Any]) -> Dict[str, Any]:
+    """Tolerant of key drift: the docs say prices.upiPrice, but a 0/missing value must NEVER look
+    like a ₹0 bargain — it becomes price=0 which the orchestrator treats as 'price unavailable'."""
+    prices = svc.get("prices") or {}
+    price = _first_price(prices, ("upiPrice", "upi_price", "inr", "INR", "price_inr", "price")) \
+        or _first_price(svc, ("upiPrice", "upi_price", "price_inr", "price", "inr_price"))
+    crypto = _first_price(prices, ("cryptoPrice", "crypto_price", "usd", "USD")) or _first_price(svc, ("cryptoPrice",))
+    try:
+        stock = int(_num(svc.get("available_stock", svc.get("stock", 0))))
+    except (TypeError, ValueError):
+        stock = 0
+    return {
+        "id": str(svc.get("service_id") or svc.get("id") or ""),
+        "name": svc.get("name"),
+        "price": price,
+        "price_crypto": crypto,
+        "currency": CURRENCY,
+        "stock": stock, "in_stock": stock > 0,
+        "requires_verification": bool(svc.get("requires_shein_verification")),
+        "price_known": price > 0,
+    }
+
+
+def raw_products() -> List[Dict[str, Any]]:
+    """Untouched supplier payload (admin debug: see the real field names when a price shows 0)."""
+    return _request("GET", "/api/v1/products").get("services", []) or []
 
 
 def get_product(service_id: str, max_age: int = LIST_CACHE_SECONDS) -> Dict[str, Any]:
@@ -156,9 +189,13 @@ def product_summary(service_id: str, usd_to_inr: float = 0.0, max_age: int = LIS
     """Compact live view (same keys as moonshots_service.product_summary; prices already INR)."""
     try:
         d = get_product(service_id, max_age=max_age)
-        return {"supplier": NAME, "ref": d["id"], "name": d["name"], "icon": "", "category": "",
-                "price": d["price"], "currency": CURRENCY, "price_inr": round(d["price"], 2),
-                "stock": d["stock"], "in_stock": d["in_stock"], "error": None}
+        out = {"supplier": NAME, "ref": d["id"], "name": d["name"], "icon": "", "category": "",
+               "price": d["price"], "currency": CURRENCY, "price_inr": round(d["price"], 2),
+               "stock": d["stock"], "in_stock": d["in_stock"], "error": None}
+        if not d.get("price_known", d["price"] > 0):
+            out["error"] = "price unavailable at supplier (₹0 / missing) - not safe to auto-buy"
+            out["code"] = "no_price"
+        return out
     except LootPagluError as exc:
         return {"supplier": NAME, "ref": str(service_id), "error": exc.message, "code": exc.code}
     except Exception as exc:  # noqa: BLE001

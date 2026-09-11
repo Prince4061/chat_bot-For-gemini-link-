@@ -191,3 +191,59 @@ def test_settings_accept_lootpaglu_key_and_toggle(client, admin_headers):
     s = client.post("/api/admin/settings", json={"lootpaglu_enabled": True, "lootpaglu_api_key": "LootPaglu_testkey1234"}, headers=admin_headers).get_json()
     assert s["lootpaglu_enabled"] is True and s["lootpaglu_api_key"].endswith("1234") and "testkey" not in s["lootpaglu_api_key"]
     client.post("/api/admin/settings", json={"lootpaglu_enabled": False, "lootpaglu_api_key": ""}, headers=admin_headers)
+
+
+# ---- the WhatsApp screenshot bug: ₹0 quote + no fallback ------------------------------------------
+
+def test_zero_price_quote_is_never_chosen(db, monkeypatch):
+    p = _product(db)
+    calls = _mock(monkeypatch, ms_price_usd=0.42, lp_price=0.0)          # Loot Paglu shows ₹0 (missing price)
+    res = dbm.replenish_supplier_stock(db, p, 1)
+    assert res["supplier"] == "moonshots" and res["bought"] == 1 and calls["orders"][0][0] == "moonshots"
+    lpq = next(q for q in res["quotes"] if q["supplier"] == "lootpaglu")
+    assert "price unavailable" in lpq["error"]
+
+
+def test_only_supplier_with_zero_price_means_no_purchase(db, monkeypatch):
+    p = _product(db, ms_id=None)
+    calls = _mock(monkeypatch, lp_price=0.0, ms_ready=False)
+    res = dbm.replenish_supplier_stock(db, p, 1)
+    assert res["bought"] == 0 and "price unavailable" in res["error"] and calls["orders"] == []
+
+
+def test_purchase_failure_falls_back_to_next_supplier(db, monkeypatch):
+    p = _product(db)
+    calls = _mock(monkeypatch, ms_price_usd=1.0, lp_price=20.0)          # LP cheapest...
+    monkeypatch.setattr(lp, "place_order", lambda sid, qty=1: (_ for _ in ()).throw(lp.LootPagluError("Insufficient INR wallet balance", "insufficient_balance", 400)))
+    res = dbm.replenish_supplier_stock(db, p, 1)
+    assert res["bought"] == 1 and res["supplier"] == "moonshots"          # ...but its order fails -> m00nshots
+    assert "fell back after" in res["reason"] and "Insufficient INR wallet balance" in res["reason"]
+    assert calls["orders"] == [("moonshots", 42, 1)]
+
+
+def test_all_purchases_fail_reports_every_attempt(db, fresh_reseller, monkeypatch):
+    p = _product(db)
+    _mock(monkeypatch, ms_price_usd=1.0, lp_price=20.0)
+    monkeypatch.setattr(lp, "place_order", lambda sid, qty=1: (_ for _ in ()).throw(lp.LootPagluError("Insufficient INR wallet balance", "insufficient_balance", 400)))
+    monkeypatch.setattr(ms, "place_order", lambda pid, qty=1: (_ for _ in ()).throw(ms.MoonshotsError("insufficient balance", "insufficient_balance", 402)))
+    res = dbm.process_reseller_claim_for(fresh_reseller, p, 1, db)
+    assert res["success"] is False and res["error"] == "OUT_OF_STOCK"
+    why = res["supplier_autobuy"]["error"]
+    assert "every supplier failed" in why and "Loot Paglu" in why and "m00nshots" in why
+
+
+def test_bot_tester_sees_auto_buy_chip(db, fresh_reseller, monkeypatch):
+    from agent_core import run_deep_agent_chat
+    p = _product(db); p.base_price = 1; db.commit()
+    _mock(monkeypatch, ms_price_usd=0.5, lp_price=0.0)
+    out = run_deep_agent_chat(f"wa_ab_{fresh_reseller.phone}", f"{p.name.lower()} link do", platform="whatsapp",
+                              owner_id=f"wa:{fresh_reseller.phone}", customer_phone=fresh_reseller.phone)
+    chip = next(t for t in out["metadata"]["tool_calls"] if t["tool"] == "auto_buy")
+    assert chip["ok"] and chip["detail"].startswith("moonshots x1")
+
+
+def test_lootpaglu_price_key_drift_is_tolerated():
+    n = lp._normalise_service({"service_id": "Paglu_2", "name": "X", "available_stock": "5", "prices": {"upi_price": "45"}})
+    assert n["price"] == 45.0 and n["stock"] == 5 and n["price_known"]
+    z = lp._normalise_service({"service_id": "Paglu_3", "name": "Y", "available_stock": 9, "prices": {"upiPrice": 0}})
+    assert z["price"] == 0.0 and z["price_known"] is False

@@ -267,6 +267,11 @@ def claim_reseller_product_link(product_name: str, quantity: int = 1, phone: str
 
         result = process_reseller_claim_for(reseller, product, quantity, db)
         record_tool_call("claim_reseller_product_link", bool(result.get("success")), result.get("error", product.slug))
+        from agent_core import _record_autobuy
+        _record_autobuy(result)
+        if not result.get("success") and result.get("error") == "OUT_OF_STOCK" and (result.get("supplier_autobuy") or {}).get("error"):
+            # Buyer-facing text stays generic; the supplier reason is for the admin (logs / Bot Tester).
+            result["admin_note"] = f"auto-buy failed: {result['supplier_autobuy']['error']}"
         if result.get("success"):
             v = result.get("link_verification") or {}
             if v.get("method") == "browser" and v.get("checked"):
