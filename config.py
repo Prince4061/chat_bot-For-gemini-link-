@@ -36,7 +36,46 @@ def _env_list(name: str, default: str = "") -> list:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _read_git_version(base) -> str:
+    """Short commit of the checked-out code + its date, read straight from .git (works on the VPS
+    without shelling out). Falls back to 'unknown'. Shown in /api/health and the admin header so a
+    stale deploy is obvious at a glance."""
+    try:
+        import datetime as _dt
+        git = base / ".git"
+        head = (git / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            ref_file = git / ref
+            if ref_file.exists():
+                sha = ref_file.read_text(encoding="utf-8").strip()
+            else:
+                sha = ""
+                packed = git / "packed-refs"
+                if packed.exists():
+                    for line in packed.read_text(encoding="utf-8").splitlines():
+                        if line.strip().endswith(ref):
+                            sha = line.split()[0]
+                            break
+        else:
+            sha = head
+        when = ""
+        log = git / "logs" / "HEAD"
+        if log.exists():
+            last = log.read_text(encoding="utf-8", errors="ignore").strip().splitlines()[-1]
+            parts = last.split("\t")[0].split()
+            for i, tok in enumerate(parts):
+                if tok.isdigit() and len(tok) == 10 and i + 1 < len(parts):
+                    when = _dt.datetime.utcfromtimestamp(int(tok)).strftime("%Y-%m-%d %H:%M UTC")
+                    break
+        return (sha[:7] if sha else "unknown") + (f" ({when})" if when else "")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 class Config:
+    APP_VERSION: str = _read_git_version(BASE_DIR)
+
     # --- Runtime mode -------------------------------------------------------
     APP_ENV: str = os.getenv("APP_ENV", "development").strip().lower()
     IS_PROD: bool = APP_ENV == "production"

@@ -113,3 +113,40 @@ def test_llm_tools_report_auto_buy_products_as_available(db, monkeypatch):
     c = json.loads(get_live_product_catalog.invoke({"user_role": "reseller", "search": p.slug}))
     item = next(i for i in c["products"] if i["id"] == p.id) if "products" in c else next(i for i in c.get("catalog", []) if i["id"] == p.id)
     assert item["in_stock"] is True and item["auto_buy"] is True
+
+
+# ---- "Mujhebgemini ki link do": glued words must still be a deterministic claim -------------------
+
+def test_glued_product_word_is_matched_and_claimed_deterministically(db, fresh_reseller, monkeypatch):
+    _mock_ms(monkeypatch)
+    slug = f"gl-{uuid.uuid4().hex[:6]}"
+    # unique brand so other tests' "Gemini ..." products can't compete in the shared test DB
+    p = dbm.Product(name=f"Zorvex AI Pro Active 18M {slug}", slug=slug, base_price=1, margin_percent=0,
+                    reseller_margin_percent=0, source="supplier", supplier_product_id=42)
+    db.add(p); db.commit()
+    dbm._NAME_WORDS_CACHE["ts"] = 0.0
+    assert dbm.find_product(db, "Mujhebzorvex ki link do").id == p.id          # glued word "mujhebzorvex" -> zorvex
+    monkeypatch.setattr(agent_core, "get_deep_agent", lambda: _EchoOldLink())   # LLM must NOT be used
+    out = agent_core.run_deep_agent_chat(f"wa_gl_{fresh_reseller.phone}", "Mujhebzorvex ki link do", **_wa(fresh_reseller))
+    assert "/new/AUTO" in out["message"] and out["metadata"]["engine"] != "deep_agent"
+
+
+def test_health_and_metrics_expose_running_version(client, admin_headers):
+    from config import Config
+    h = client.get("/api/health").get_json()
+    assert h["version"] == Config.APP_VERSION and h["version"]
+    m = client.get("/api/admin/metrics", headers=admin_headers).get_json()
+    assert m["version"] == Config.APP_VERSION
+
+
+def test_ambiguous_brand_prefers_a_product_that_can_be_delivered(db, monkeypatch):
+    """Two 'Quorvia' products: one out of stock, one auto-buy -> 'quorvia ki link do' picks the deliverable one."""
+    _mock_ms(monkeypatch)
+    a = dbm.Product(name="Quorvia Basic", slug=f"qb-{uuid.uuid4().hex[:6]}", base_price=1, margin_percent=0, reseller_margin_percent=0)
+    b = dbm.Product(name="Quorvia AI Pro Active 18M", slug=f"qp-{uuid.uuid4().hex[:6]}", base_price=1, margin_percent=0,
+                    reseller_margin_percent=0, source="supplier", supplier_product_id=42)
+    db.add_all([a, b]); db.commit()
+    dbm._NAME_WORDS_CACHE["ts"] = 0.0
+    assert dbm.find_product(db, "quorvia ki link do").id == b.id               # shorter name loses: it can't deliver
+    db.add(dbm.InviteLink(product_id=a.id, link_or_key=f"QB-{uuid.uuid4().hex}")); db.commit()
+    assert dbm.find_product(db, "quorvia ki link do").id == a.id               # both deliverable -> shorter name

@@ -275,6 +275,7 @@ def health_check():
         "engine": status["engine"],
         "model": status["model"],
         "admin_auth_required": bool(Config.ADMIN_API_KEY),
+        "version": Config.APP_VERSION,
         "timestamp": datetime.utcnow().isoformat(),
     }), (200 if db_ok else 503)
 
@@ -496,6 +497,7 @@ def get_admin_metrics():
             "low_stock_products": low_stock,
             "recent_claims": [c.to_dict() for c in recent_claims],
             "agent": agent_status(),
+            "version": Config.APP_VERSION,
         })
     finally:
         db.close()

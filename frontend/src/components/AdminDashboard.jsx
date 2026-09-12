@@ -137,6 +137,12 @@ export default function AdminDashboard({ onSwitchToChat, onOpenSidebar }) {
               {metrics.agent.engine === 'deep_agent' ? `AI: ${metrics.agent.model}` : 'Fallback engine'}
             </span>
           )}
+          {metrics?.version && (
+            <span title="Server par chal raha code (git commit + date). Deploy ke baad ye badalna chahiye."
+              className="hidden md:inline-flex items-center px-2 py-1 rounded-lg text-[10px] font-mono bg-[#212121] text-[#8e8ea0] border border-white/10">
+              build {metrics.version}
+            </span>
+          )}
           <button
             onClick={onSwitchToChat}
             className="px-3.5 py-1.5 bg-[#2f2f2f] hover:bg-[#3a3a3a] border border-white/15 text-[#ececec] text-xs font-semibold rounded-xl transition-colors hidden sm:flex items-center gap-1.5"

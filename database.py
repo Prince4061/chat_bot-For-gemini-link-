@@ -811,6 +811,13 @@ def find_product(db, name_or_slug_or_id: Any, active_only: bool = True) -> Optio
         return sorted(candidates, key=lambda p: len(p.name))[0]
 
     text_tokens = set(re.findall(r"[a-z0-9]+", raw.lower()))
+    # Typos that glue words together ("mujhebgemini ki link do", "geminilink") hide the brand word
+    # inside a longer token. Split such tokens on any known product word so matching still works.
+    for tok in list(text_tokens):
+        if len(tok) >= 8:
+            for w in _product_name_words(db):
+                if w in tok and w != tok:
+                    text_tokens.add(w)
     # SQL pre-filter: only products whose name/slug contains at least one significant word.
     sig = [t for t in text_tokens if len(t) >= 3 and t not in _QUERY_NOISE]
     if not sig:
@@ -821,18 +828,54 @@ def find_product(db, name_or_slug_or_id: Any, active_only: bool = True) -> Optio
         conds.append(Product.slug.ilike(f"%{t}%"))
     cands = q.filter(or_(*conds)).limit(3000).all()
 
-    best, best_key = None, None
+    scored = []
     for p in cands:
         tokens = set(re.findall(r"[a-z0-9]+", f"{p.name} {p.slug}".lower()))
         distinctive = {t for t in tokens if len(t) >= 4 and t not in _GENERIC_PRODUCT_WORDS}
         primary = len(distinctive & text_tokens)          # brand / model / number words
         if primary == 0:
             continue
-        secondary = len(tokens & text_tokens)             # + tier words (team, premium, ...)
-        key = (primary, secondary, -len(p.name))
-        if best_key is None or key > best_key:
-            best, best_key = p, key
-    return best
+        # tier words (team, premium, ...) - but never claim/noise words like "link", "do", "ki",
+        # otherwise "gemini ki link do" favours whichever product happens to have "Link" in its name.
+        secondary = len(tokens & (text_tokens - _QUERY_NOISE))
+        scored.append(((primary, secondary), p))
+    if not scored:
+        return None
+    top = max(k for k, _ in scored)
+    tied = [p for k, p in scored if k == top]
+    if len(tied) == 1:
+        return tied[0]
+    # Same words matched several products ("gemini" -> "Gemini Advanced" AND "Gemini AI Pro 18M"):
+    # prefer one that can actually be delivered (local stock or auto-buy), then the shorter name.
+    def _orderable(p) -> int:
+        try:
+            return 1 if (p.get_available_stock_count(db) > 0 or p.is_supplier_backed()) else 0
+        except Exception:  # noqa: BLE001
+            return 0
+    tied.sort(key=lambda p: (-_orderable(p), len(p.name)))
+    return tied[0]
+
+
+_NAME_WORDS_CACHE: Dict[str, Any] = {"ts": 0.0, "words": []}
+
+
+def _product_name_words(db) -> List[str]:
+    """Distinctive words (>= 5 chars) from all active product names, cached 60 s; longest first so
+    'gemini' is found inside 'mujhebgemini' before shorter words get a chance."""
+    import time as _t
+    if _t.time() - _NAME_WORDS_CACHE["ts"] < 60 and _NAME_WORDS_CACHE["words"]:
+        return _NAME_WORDS_CACHE["words"]
+    words = set()
+    try:
+        for (name,) in db.query(Product.name).filter(Product.is_active == True).all():  # noqa: E712
+            for w in re.findall(r"[a-z0-9]+", (name or "").lower()):
+                if len(w) >= 5 and w not in _GENERIC_PRODUCT_WORDS and not w.isdigit():
+                    words.add(w)
+    except Exception:  # noqa: BLE001
+        pass
+    out = sorted(words, key=len, reverse=True)[:5000]
+    _NAME_WORDS_CACHE.update(ts=_t.time(), words=out)
+    return out
 
 
 _GENERIC_PRODUCT_WORDS = {
