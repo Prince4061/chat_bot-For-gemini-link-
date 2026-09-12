@@ -196,6 +196,7 @@ def replenish(db, product, needed: int) -> Dict[str, Any]:
                 alert_admin_autobuy_failure(product, result)
             except Exception:  # noqa: BLE001
                 pass
+            _remember_attempt(db, product, result)
             return result
         attempts: List[str] = []
         # Try the best supplier first; if the PURCHASE itself fails (balance, stock race, 5xx),
@@ -252,6 +253,7 @@ def replenish(db, product, needed: int) -> Dict[str, Any]:
             if attempts:
                 result["reason"] = reason + " | fell back after: " + "; ".join(attempts)
             logger.info("Auto-bought %d x %s from %s (order %s) - %s", len(creds), product.slug, best["supplier"], code, result["reason"])
+            _remember_attempt(db, product, result)
             return result
         result["error"] = "every supplier failed: " + "; ".join(attempts)
         logger.error("Auto-buy for %s failed at all suppliers: %s", product.slug, result["error"])
@@ -265,7 +267,26 @@ def replenish(db, product, needed: int) -> Dict[str, Any]:
             alert_admin_autobuy_failure(product, result)
         except Exception:  # noqa: BLE001
             pass
+    _remember_attempt(db, product, result)
     return result
+
+
+def _remember_attempt(db, product, result: Dict[str, Any]) -> None:
+    """Persist the last live attempt on the product so the admin sees WHY without logs."""
+    import json as _json
+    import time as _time
+    try:
+        product.last_autobuy_json = _json.dumps({
+            "at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "bought": result.get("bought", 0), "supplier": result.get("supplier"),
+            "unit_price_inr": result.get("unit_price_inr"), "order_code": result.get("order_code"),
+            "error": result.get("error"), "reason": result.get("reason"),
+            "duplicates": result.get("duplicates"), "duplicate_order_code": result.get("duplicate_order_code"),
+            "quotes": result.get("quotes") or [],
+        }, ensure_ascii=False)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
 
 
 _ALERTS: Dict[int, float] = {}          # product_id -> last alert ts (don't spam the admin)

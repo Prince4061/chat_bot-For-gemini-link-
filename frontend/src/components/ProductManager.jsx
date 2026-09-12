@@ -452,6 +452,16 @@ export default function ProductManager() {
                       </button>
                     )}
                   </div>
+                  {p.last_autobuy && (
+                    <div className={`rounded-lg border p-2 text-[11px] leading-snug ${p.last_autobuy.bought ? 'bg-emerald-950/30 border-emerald-500/30 text-emerald-200' : 'bg-rose-950/30 border-rose-500/30 text-rose-200'}`}>
+                      <div className="font-semibold">Last live auto-buy ({p.last_autobuy.at}): {p.last_autobuy.bought ? `✅ ${p.last_autobuy.bought} link ${p.last_autobuy.supplier} se @₹${p.last_autobuy.unit_price_inr}` : '❌ FAILED'}</div>
+                      {p.last_autobuy.error && <div className="break-words">{p.last_autobuy.error}</div>}
+                      {p.last_autobuy.reason && !p.last_autobuy.error && <div className="opacity-80 break-words">{p.last_autobuy.reason}</div>}
+                      {p.last_autobuy.quotes?.length > 0 && (
+                        <div className="opacity-80 mt-0.5">{p.last_autobuy.quotes.map((q) => `${q.label}: ${q.error ? q.error : `₹${Number(q.price_inr).toFixed(0)} · stock ${q.stock}`}`).join(' | ')}</div>
+                      )}
+                    </div>
+                  )}
                   {dryRun[p.id] && !dryRun[p.id].loading && (
                     <div className={`rounded-lg border p-2 text-[11px] leading-snug ${dryRun[p.id].ok ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-200' : 'bg-amber-950/40 border-amber-500/30 text-amber-200'}`}>
                       <div>{dryRun[p.id].verdict}</div>

@@ -432,3 +432,31 @@ def test_lootpaglu_list_price_zero_falls_back_to_order_history(monkeypatch):
     assert items[0]["price"] == 50.0 and items[0]["price_known"] and items[0]["price_source"] == "order_history"
     summ = lp.product_summary("Paglu_1", max_age=0)
     assert summ["error"] is None and summ["price_inr"] == 50.0          # usable for cheapest-supplier choice
+
+
+def test_failed_autobuy_reason_reaches_buyer_reply_and_product_card(db, fresh_reseller, monkeypatch):
+    p = _product(db, lp_id=None); p.base_price = 1; db.commit()
+    _mock(monkeypatch, ms_price_usd=1.0, lp_ready=False)
+    db.add(dbm.InviteLink(product_id=p.id, link_or_key="ALREADY-GIVEN", status="claimed")); db.commit()
+    monkeypatch.setattr(ms, "place_order", lambda pid, qty=1: {"order_code": "ORD-DUP", "credentials": ["ALREADY-GIVEN"]})
+    res = dbm.process_reseller_claim_for(fresh_reseller, p, 1, db)
+    assert res["success"] is False and "duplicate" in res["message"].lower() and "Admin ko alert" in res["message"]
+    db.expire_all()
+    last = db.query(dbm.Product).get(p.id).last_autobuy()
+    assert last and last["bought"] == 0 and "DUPLICATE" in last["error"] and last["duplicate_order_code"] == "ORD-DUP"
+    assert db.query(dbm.Product).get(p.id).to_dict(db)["last_autobuy"]["error"] == last["error"]
+    # a later success overwrites it
+    monkeypatch.setattr(ms, "place_order", lambda pid, qty=1: {"order_code": "ORD-OK", "credentials": [f"NEW-{uuid.uuid4().hex}"]})
+    res2 = dbm.process_reseller_claim_for(fresh_reseller, p, 1, db)
+    db.expire_all()
+    assert res2["success"] and db.query(dbm.Product).get(p.id).last_autobuy()["bought"] == 1
+
+
+def test_failure_hint_categories():
+    h = dbm.autobuy_failure_hint
+    assert "duplicate" in h({"error": "every supplier failed: m00nshots: returned 1 DUPLICATE link(s)"})
+    assert "balance kam" in h({"error": "Insufficient INR wallet balance"})
+    assert "price nahi" in h({"error": "Loot Paglu: price unavailable at supplier"})
+    assert "limit se upar" in h({"error": "supplier price ₹90 above cap ₹50"})
+    assert "connect nahi" in h({"error": "supplier disabled or no API key"})
+    assert h({}) == "" and h(None) == ""

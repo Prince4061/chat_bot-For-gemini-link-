@@ -12,6 +12,7 @@ Concurrency model
 * Every multi-step operation runs inside one transaction and is rolled back as a whole.
 """
 import re
+import json
 import time
 import secrets
 import string
@@ -117,6 +118,7 @@ class Product(Base):
     lootpaglu_service_id = Column(String(50), nullable=True)  # Loot Paglu service id (e.g. "Paglu_1")
     supplier_preference = Column(String(20), default="cheapest")   # cheapest | moonshots | lootpaglu
     max_buy_price_inr = Column(Float, nullable=True)          # never auto-buy above this ₹ price
+    last_autobuy_json = Column(Text, nullable=True)           # last live auto-buy attempt (what/why) for the admin
     supplier_max_price = Column(Float, nullable=True)         # legacy USD cap (migrated to max_buy_price_inr)
 
     links = relationship("InviteLink", back_populates="product", cascade="all, delete-orphan")
@@ -132,6 +134,12 @@ class Product(Base):
             return round(float(self.reseller_price), 2)
         rm = float(self.reseller_margin_percent or 0.0)
         return round(self.base_price + self.base_price * (rm / 100.0), 2)
+
+    def last_autobuy(self) -> Optional[Dict[str, Any]]:
+        try:
+            return json.loads(self.last_autobuy_json) if self.last_autobuy_json else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def is_supplier_backed(self) -> bool:
         """Auto-buy product with at least one supplier mapping."""
@@ -173,6 +181,7 @@ class Product(Base):
             "max_buy_price_inr": self.max_buy_price_inr,
             "supplier_max_price": self.supplier_max_price,
             "supplier_backed": self.is_supplier_backed(),
+            "last_autobuy": self.last_autobuy(),
             "stock_count": stock,
             "in_stock": stock > 0 or self.is_supplier_backed(),
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -1263,6 +1272,28 @@ def find_duplicate_deliveries(db) -> List[Dict[str, Any]]:
     return out
 
 
+def autobuy_failure_hint(supplier_buy: Optional[Dict[str, Any]]) -> str:
+    """Short, honest Hinglish reason a buyer/admin can act on when auto-buy could not deliver."""
+    err = str((supplier_buy or {}).get("error") or "").lower()
+    if not err:
+        return ""
+    if "duplicate" in err:
+        return "supplier ne wahi link bheji jo pehle di ja chuki thi (duplicate) - isliye rok di gayi"
+    if "insufficient" in err or "balance" in err:
+        return "supplier account me balance kam hai"
+    if "price unavailable" in err or "no_price" in err:
+        return "supplier ka price nahi mil raha"
+    if "above cap" in err:
+        return "supplier price aapki max limit se upar hai"
+    if "disabled" in err or "no api key" in err:
+        return "supplier connect nahi hai (Settings)"
+    if "out of stock" in err:
+        return "supplier ke paas bhi stock nahi"
+    if "not found" in err:
+        return "supplier product ID galat hai"
+    return err[:120]
+
+
 def _link_verification(agg: Dict[str, Any], links: List["InviteLink"]) -> Dict[str, Any]:
     """Summary handed to the bot so it can tell the buyer whether the link was live-verified.
     `method` is "browser" only if the logged-in browser actually looked at one of THESE links, and
@@ -1381,12 +1412,16 @@ def process_reseller_claim_for(reseller: Reseller, product: Product, quantity: i
             if len(links) < quantity:
                 db.rollback()
                 available = product.get_available_stock_count(db)
+                hint = autobuy_failure_hint(supplier_buy)
+                msg = f"Only {available} link(s) currently in stock for {product.name}. Requested {quantity}. No money was deducted."
+                if hint:
+                    msg += f"\n\nAuto-buy try kiya par nahi ho paaya: {hint}. Admin ko alert bhej diya gaya hai."
                 return {
                     "success": False,
                     "error": "OUT_OF_STOCK",
-                    "message": f"Only {available} link(s) currently in stock for {product.name}. Requested {quantity}. No money was deducted.",
+                    "message": msg,
                     "available_stock": available,
-                    "supplier_autobuy": supplier_buy,     # admin-visible WHY (never shown to the buyer)
+                    "supplier_autobuy": supplier_buy,     # full detail for admin (Bot Tester / Products card)
                 }
 
             # 3. Ledger entries (one per link).
