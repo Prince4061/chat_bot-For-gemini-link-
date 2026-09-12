@@ -347,7 +347,7 @@ export default function ProductManager() {
                       className="py-0.5 px-1.5 bg-[#212121] border border-white/15 rounded text-xs text-[#ececec] focus:outline-none"
                     >
                       <option value="stock">Local stock</option>
-                      <option value="supplier">Auto-buy (cheapest supplier)</option>
+                      <option value="supplier">Local stock pehle, khatam ho to auto-buy (cheapest supplier)</option>
                     </select>
                   </div>
                   {(p.source || 'stock') !== 'stock' && (() => {

@@ -114,6 +114,8 @@ def get_live_product_catalog(user_role: str = "customer", search: str = "") -> s
                 "reseller_price_inr": p.get_reseller_price(),
                 "in_stock": stock > 0 or p.is_supplier_backed(),
                 "available_stock": stock,
+                "auto_buy": bool(p.is_supplier_backed()),
+                "stock_note": ("in stock" if stock > 0 else ("AUTO-BUY: bought from supplier on demand - treat as IN STOCK, call the claim/order tool" if p.is_supplier_backed() else "out of stock")),
             })
         record_tool_call("get_live_product_catalog", True, f"{len(catalog)}/{matched} products")
         note = None
@@ -149,6 +151,8 @@ def get_product_pricing(product_name_or_slug: str, user_role: str = "customer") 
             "reseller_price_inr": product.get_reseller_price(),
             "available_stock": stock,
             "in_stock": stock > 0 or product.is_supplier_backed(),
+            "auto_buy": bool(product.is_supplier_backed()),
+            "stock_note": ("in stock" if stock > 0 else ("AUTO-BUY: bought from supplier on demand - treat as IN STOCK, call the claim/order tool" if product.is_supplier_backed() else "out of stock")),
         })
     finally:
         db.close()

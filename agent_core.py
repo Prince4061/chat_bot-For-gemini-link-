@@ -16,7 +16,7 @@ import threading
 import datetime
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Tuple, Dict, Any, List, Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
@@ -35,6 +35,7 @@ from database import (
     Product,
     Reseller,
     CustomerOrder,
+    InviteLink,
     find_product,
     generate_order_id,
     verify_reseller_auth,
@@ -404,11 +405,12 @@ def run_deep_agent_chat(
                 .all()
             )
             history: List[Any] = []
+            turn_started_at = utcnow()
             for m in reversed(recent):
                 if m.role == "user":
                     history.append(HumanMessage(content=m.content))
                 elif m.role == "assistant" and m.content:
-                    history.append(AIMessage(content=m.content))
+                    history.append(AIMessage(content=_redact_delivered_links(m.content)))
             # The current user message is already the last item of `recent`.
 
             # 3. Run the Deep Agent (or the rule engine)
@@ -433,6 +435,8 @@ def run_deep_agent_chat(
                         fact_reply = _verified_reseller_fact_reply(db, _r, user_message)
                         if not fact_reply and _repeat_claim_target(db, _r, user_message):
                             fact_reply = "__repeat_claim__"   # rule engine performs the actual claim
+                        if not fact_reply and _reseller_claim_intent(db, user_message, session_rec):
+                            fact_reply = "__claim__"          # atomic claim via rule engine, never an LLM replay
                 # Trained answers: a confident match is answered EXACTLY as the admin trained it, on both
                 # engines (weak matches still go to the LLM, which has the whole FAQ in its prompt).
                 kb_first = None
@@ -494,6 +498,16 @@ def run_deep_agent_chat(
                     response_text = handle_rule_based_fallback(user_message, session_rec, db)
             finally:
                 reset_session_context(token)
+
+            # 3b. Safety net: never send a link that was delivered in an earlier turn (LLM replay).
+            try:
+                token2 = set_session_context(ctx)
+                try:
+                    response_text, _removed = _scrub_stale_links(db, response_text, turn_started_at)
+                finally:
+                    reset_session_context(token2)
+            except Exception:  # noqa: BLE001
+                logger.exception("stale-link guard failed (reply sent unchanged)")
 
             # 4. Persist the assistant turn
             metadata = {"todos": todos, "engine": engine, "tool_calls": ctx.tool_calls}
@@ -592,6 +606,60 @@ def _fmt_links(links: List[str]) -> str:
 
 
 _GREETING_RE = re.compile(r"\W*(hi+|hello+|hey+|hii+|namaste|namaskar|start|menu|help|yo|ok|hlo)\W*")
+
+
+_LINKISH_RE = re.compile(r"https?://[^\s`'\"<>)\]]+|(?<![\w/])[A-Za-z0-9][A-Za-z0-9\-_:@.]{15,}(?![\w/])")
+
+
+def _redact_delivered_links(text: str) -> str:
+    """Old assistant turns go to the LLM WITHOUT the actual links: a model must never be able to
+    'resend' a link from memory (a WhatsApp user who cleared their chat and asks again must get a
+    NEW claim through the tool, or nothing)."""
+    if not text:
+        return text
+    return re.sub(r"https?://[^\s`'\"<>)\]]+", "[link delivered earlier - never resend; call the claim tool for a new one]", text)
+
+
+def _scrub_stale_links(db, text: str, turn_started_at) -> Tuple[str, int]:
+    """Remove from an outgoing reply any inventory link that was claimed BEFORE this turn began
+    (i.e. not freshly delivered by a tool just now). Returns (clean_text, removed_count)."""
+    if not text:
+        return text, 0
+    removed = 0
+    seen = set()
+    for m in _LINKISH_RE.finditer(text):
+        tok = m.group(0).rstrip(".,;:!?)")
+        if tok in seen or len(tok) < 12:
+            continue
+        seen.add(tok)
+        row = (db.query(InviteLink.id, InviteLink.status, InviteLink.claimed_at)
+               .filter(InviteLink.link_or_key == tok).first())
+        if not row or row.status == "available":
+            continue
+        if row.status == "claimed" and row.claimed_at and turn_started_at and row.claimed_at >= turn_started_at:
+            continue                                   # delivered by a tool in THIS turn - legit
+        text = text.replace(tok, "[purani link hata di gayi - nayi link ke liye 'link do' likho]")
+        removed += 1
+    if removed:
+        record_tool_call("stale_link_guard", False, f"removed {removed} previously delivered link(s) from the reply")
+        logger.warning("Stale-link guard removed %d previously delivered link(s) from an outgoing reply", removed)
+    return text, removed
+
+
+def _reseller_claim_intent(db, user_message: str, session_rec: ChatSessionRecord) -> bool:
+    """Verified reseller naming a product with claim words (or a bare product name) -> the claim
+    must be executed deterministically by the rule engine, never left to the LLM."""
+    if not session_rec or not session_rec.reseller_id:
+        return False
+    msg = (user_message or "").strip().lower()
+    if not msg or not find_product(db, user_message):
+        return False
+    if any(k in msg for k in _CATALOG_KEYWORDS):
+        return False                                   # "gemini price kya hai" -> price card, not a claim
+    if knowledge_decision(db, user_message, session_rec)["decision"] == "kb":
+        return False                                   # trained FAQ wins ("gemini kaise activate kare")
+    short = len(re.findall(r"[a-z0-9\u0900-\u097f]+", msg)) <= 3
+    return bool(_CLAIM_INTENT_RE.search(msg) or short)
 
 
 _REPEAT_RE = re.compile(r"\b(aur|more|again|dobara|phir\s*se|wahi|same|repeat)\b", re.I)
